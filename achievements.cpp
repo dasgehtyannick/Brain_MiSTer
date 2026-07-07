@@ -769,15 +769,20 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 					event->achievement->description);
 					gba_dump_trigger(event->achievement->id);
 				char title_buf[96];
-				char desc_buf[192];
 				ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
-				ra_format_text(event->achievement->description, desc_buf, sizeof(desc_buf), 28, 28, 3);
-				// In multiline mode, prefix desc with "\-> " so it reads as a sub-line of the title
+				// In multiline mode, prefix desc with "\-> " so it reads as a
+				// sub-line of the title. The prefix is added BEFORE wrapping so
+				// its 4 chars count toward the first line's width (adding it
+				// after wrapping pushed the first line past the OSD width).
 				char desc_display[200];
-				if (g_multiline_desc)
-					snprintf(desc_display, sizeof(desc_display), "\\-> %s", desc_buf);
-				else
-					snprintf(desc_display, sizeof(desc_display), "%s", desc_buf);
+				if (g_multiline_desc) {
+					char desc_prefixed[224];
+					snprintf(desc_prefixed, sizeof(desc_prefixed), "\\-> %s",
+						event->achievement->description);
+					ra_format_text(desc_prefixed, desc_display, sizeof(desc_display), 28, 28, 3);
+				} else {
+					ra_format_text(event->achievement->description, desc_display, sizeof(desc_display), 28, 28, 3);
+				}
 				char buf[NOTIF_TEXT_MAX];
 				snprintf(buf, sizeof(buf),
 					">> ACHIEVEMENT <<\n\n%s\n%s",
