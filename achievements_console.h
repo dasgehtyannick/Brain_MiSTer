@@ -75,6 +75,8 @@ extern const console_handler_t g_console_neogeo;
 extern const console_handler_t g_console_gba;
 extern const console_handler_t g_console_megacd;
 extern const console_handler_t g_console_atari2600;
+extern const console_handler_t g_console_atari7800; // not in lookup table: switched by .a78 extension
+extern const console_handler_t g_console_saturn;
 extern const console_handler_t g_console_tgfx16;
 extern const console_handler_t g_console_s32x;
 
@@ -93,6 +95,16 @@ void init_all_console_handlers(void);
 // Requires: achievements_stall_recovery_enabled() from achievements.h
 int optionc_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
                                   const char *console_name);
+
+// Shared OptionC backward-frame resync.
+// Call right after reading resp_frame, before comparing it to last_resp_frame.
+// If the FPGA frame counter went backward (core was reset without the ARM
+// being notified — e.g. savestate load, download reset, PAL/NTSC switch, or a
+// stale post-reset response), resyncs last_resp_frame so tracking resumes on
+// the next VBlank instead of stalling until the counter catches up.
+// Returns 1 if a resync happened.
+int optionc_resync_if_backward(console_state_t *state, uint32_t resp_frame,
+                                const char *console_name);
 
 // GBA: dump valcache when an achievement triggers (call from event handler)
 void gba_dump_trigger(uint32_t ach_id);

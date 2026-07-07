@@ -155,6 +155,7 @@ static int nes_poll(void *map, void *client, int game_loaded)
 		} else {
 			// Phase 3: Normal — cache miss handled in read_memory
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+			optionc_resync_if_backward(&g_nes_state, resp_frame, "NES");
 
 			if (g_nes_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
 				g_nes_state.cache_reindexing = 0;
@@ -243,6 +244,7 @@ static int nes_poll(void *map, void *client, int game_loaded)
 		}
 	} else {
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+		optionc_resync_if_backward(&g_nes_state, resp_frame, "NES");
 		if (resp_frame > g_nes_state.last_resp_frame) {
 			g_nes_state.last_resp_frame = resp_frame;
 			g_nes_state.game_frames++;

@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netdb.h>
@@ -202,6 +203,12 @@ static int g_recollect_interval        = 600; // frames between address re-colle
 static int g_smart_cache               = -1; // -1 = default per console, 1 = smart cache: rtquery on cache miss, no periodic recollect
 static int g_n64_snapshot              = 0;  // 1 = snapshot RDRAM at VBlank for consistent reads
 static int g_multiline_desc            = 0;  // 1 = wrap long text to extra lines instead of truncating with "..."
+
+// Debug watch list (retroachievements.cfg: watch=19807d,19795a — RA addresses
+// in hex). Handlers log every value change of these addresses per frame.
+#define RA_WATCH_MAX 16
+static uint32_t g_watch_addrs[RA_WATCH_MAX];
+static int g_watch_count = 0;
 static char g_ua_clause[64]            = ""; // rcheevos user-agent clause (e.g. "rcheevos/11.6")
 static char g_fpga_core_version[8]     = "0.1"; // version reported by FPGA in DDRAM header
 
@@ -273,8 +280,28 @@ static void *ra_play_thread(void *arg)
 {
 	(void)arg;
 	// Only play if the file exists — silent no-op otherwise
-	if (access(RA_SFX_PATH, R_OK) == 0)
-		system("aplay -q " RA_SFX_PATH " 2>/dev/null");
+	if (access(RA_SFX_PATH, R_OK) != 0) return NULL;
+
+	// fork/exec instead of system(): on cores built with MISTER_DISABLE_ALSA
+	// (e.g. N64, PSX) the FPGA never drains the ALSA ring buffer, so aplay
+	// blocks forever and every unlock would leak a process + thread. Kill it
+	// after a timeout instead.
+	pid_t pid = fork();
+	if (pid == 0) {
+		int fd = open("/dev/null", O_RDWR);
+		if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+		execlp("aplay", "aplay", "-q", RA_SFX_PATH, (char *)NULL);
+		_exit(127);
+	}
+	if (pid < 0) return NULL;
+
+	// The jingle lasts ~1s; allow 5s before declaring aplay stuck.
+	for (int i = 0; i < 50; i++) {
+		if (waitpid(pid, NULL, WNOHANG) == pid) return NULL;
+		usleep(100000);
+	}
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
 	return NULL;
 }
 
@@ -569,6 +596,17 @@ static int ra_load_credentials(void)
 			g_gba_reset_ram = atoi(val);
 		} else if (!strcasecmp(key, "multiline_desc")) {
 			g_multiline_desc = atoi(val);
+		} else if (!strcasecmp(key, "watch")) {
+			g_watch_count = 0;
+			const char *p = val;
+			while (*p && g_watch_count < RA_WATCH_MAX) {
+				char *end;
+				unsigned long a = strtoul(p, &end, 16);
+				if (end == p) break;
+				g_watch_addrs[g_watch_count++] = (uint32_t)a;
+				p = end;
+				while (*p == ',' || *p == ' ') p++;
+			}
 		}
 	}
 	fclose(f);
@@ -620,15 +658,45 @@ static void ra_format_text(const char *text, char *out, size_t out_size, int tru
 		for (int line = 0; line < max_lines && pos < len && written + 1 < out_size; line++) {
 			if (line > 0) { out[written++] = '\n'; out[written] = '\0'; }
 			size_t take = len - pos;
-			if (take > (size_t)wrap_width) take = (size_t)wrap_width;
+			if (take > (size_t)wrap_width) {
+				take = (size_t)wrap_width;
+				// Word wrap: if the cut lands inside a word, break at the last
+				// space instead so the whole word moves to the next line.
+				// (A single word longer than the line still hard-breaks.)
+				if (text[pos + take] != ' ') {
+					size_t s = take;
+					while (s > 0 && text[pos + s - 1] != ' ') s--;
+					if (s > 0) take = s;
+				}
+			}
 			size_t avail = out_size - written - 1;
 			if (take > avail) take = avail;
 			memcpy(out + written, text + pos, take);
+			// Drop trailing spaces from the line end
+			while (take > 0 && out[written + take - 1] == ' ') take--;
 			written += take;
 			out[written] = '\0';
 			pos += take;
+			// Skip spaces at the start of the next line
+			while (pos < len && text[pos] == ' ') pos++;
 		}
-		if (pos < len && written + 3 < out_size) strcat(out, "...");
+		if (pos < len && written + 3 < out_size) {
+			// The "..." must also fit in wrap_width: shrink the last line to
+			// wrap_width-3, preferring a word boundary.
+			size_t line_start = written;
+			while (line_start > 0 && out[line_start - 1] != '\n') line_start--;
+			size_t line_len = written - line_start;
+			if (line_len + 3 > (size_t)wrap_width) {
+				size_t keep = (size_t)wrap_width - 3;
+				size_t s = keep;
+				while (s > 0 && out[line_start + s - 1] != ' ') s--;
+				if (s > 0) keep = s;
+				while (keep > 0 && out[line_start + keep - 1] == ' ') keep--;
+				written = line_start + keep;
+				out[written] = '\0';
+			}
+			strcat(out, "...");
+		}
 	}
 }
 
@@ -670,12 +738,15 @@ static void ra_server_call(const rc_api_request_t *request,
 {
 	(void)client;
 
-	// Log the request (mask token for security)
+	// Log the request (mask token and password for security)
 	if (request->post_data) {
 		const char *token_pos = strstr(request->post_data, "&t=");
-		if (token_pos) {
-			int prefix_len = (int)(token_pos - request->post_data);
-			RA_LOG("HTTP: POST %s [%.*s&t=***]", request->url, prefix_len, request->post_data);
+		const char *pass_pos  = strstr(request->post_data, "&p=");
+		const char *mask_pos  = token_pos ? token_pos : pass_pos;
+		const char *mask_key  = token_pos ? "&t=" : "&p=";
+		if (mask_pos) {
+			int prefix_len = (int)(mask_pos - request->post_data);
+			RA_LOG("HTTP: POST %s [%.*s%s***]", request->url, prefix_len, request->post_data, mask_key);
 		} else {
 			RA_LOG("HTTP: POST %s [%.80s%s]", request->url,
 				request->post_data, strlen(request->post_data) > 80 ? "..." : "");
@@ -766,15 +837,20 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 					event->achievement->description);
 					gba_dump_trigger(event->achievement->id);
 				char title_buf[96];
-				char desc_buf[192];
 				ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
-				ra_format_text(event->achievement->description, desc_buf, sizeof(desc_buf), 28, 28, 3);
-				// In multiline mode, prefix desc with "\-> " so it reads as a sub-line of the title
+				// In multiline mode, prefix desc with "\-> " so it reads as a
+				// sub-line of the title. The prefix is added BEFORE wrapping so
+				// its 4 chars count toward the first line's width (adding it
+				// after wrapping pushed the first line past the OSD width).
 				char desc_display[200];
-				if (g_multiline_desc)
-					snprintf(desc_display, sizeof(desc_display), "\\-> %s", desc_buf);
-				else
-					snprintf(desc_display, sizeof(desc_display), "%s", desc_buf);
+				if (g_multiline_desc) {
+					char desc_prefixed[224];
+					snprintf(desc_prefixed, sizeof(desc_prefixed), "\\-> %s",
+						event->achievement->description);
+					ra_format_text(desc_prefixed, desc_display, sizeof(desc_display), 28, 28, 3);
+				} else {
+					ra_format_text(event->achievement->description, desc_display, sizeof(desc_display), 28, 28, 3);
+				}
 				char buf[NOTIF_TEXT_MAX];
 				snprintf(buf, sizeof(buf),
 					">> ACHIEVEMENT <<\n\n%s\n%s",
@@ -1311,6 +1387,18 @@ void achievements_load_game(const char *rom_path, uint32_t crc32)
         RA_LOG("ROM path: %s", rom_path);
         RA_LOG("CRC32: %08X", crc32);
 
+#ifdef HAS_RCHEEVOS
+        // Switching game without a core restart: drop the previous rc_client
+        // session (also aborts an in-flight async load) before loading the new
+        // one, so unlock state/deltas from the old game can't leak into it.
+        if (g_client && (g_game_loaded || g_game_load_pending)) {
+                RA_LOG("Previous game session active -- unloading before new load");
+                rc_client_unload_game(g_client);
+                g_game_loaded = 0;
+                g_game_load_pending = 0;
+        }
+#endif
+
         // Store ROM path
         snprintf(g_rom_path, sizeof(g_rom_path), "%s", rom_path);
 
@@ -1324,6 +1412,18 @@ void achievements_load_game(const char *rom_path, uint32_t crc32)
                 } else {
                         extern const console_handler_t g_console_nes;
                         g_active_handler = &g_console_nes;
+                }
+        }
+
+        // Shared ATARI7800 core runs both consoles: .a78 ROMs use the 7800
+        // handler (4KB RAM mirror, ID 51), everything else the 2600 one (RIOT).
+        if (g_active_handler && (g_active_handler->console_id == 25 || g_active_handler->console_id == 51)) {
+                size_t len = strlen(rom_path);
+                if (len >= 4 && strcasecmp(rom_path + len - 4, ".a78") == 0) {
+                        g_active_handler = &g_console_atari7800;
+                        RA_LOG("A78 ROM detected, switching handler to Atari 7800 (ID 51)");
+                } else {
+                        g_active_handler = &g_console_atari2600;
                 }
         }
 
@@ -1782,6 +1882,12 @@ int achievements_smart_cache_enabled(void)
 int achievements_n64_snapshot_enabled(void)
 {
 	return g_n64_snapshot;
+}
+
+int achievements_watch_list(const uint32_t **addrs)
+{
+	if (addrs) *addrs = g_watch_addrs;
+	return g_watch_count;
 }
 
 void achievements_info(void)

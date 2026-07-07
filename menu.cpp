@@ -2557,7 +2557,6 @@ void HandleUI(void)
 											opt = "[0]";
 										}
 									}
-									if (!bit) achievements_notify_core_reset();
 									if (is_pce() && !bit) pcecd_reset();
 									if (is_saturn() && !bit) saturn_reset();
 									if (is_n64() && !bit) n64_reset();
@@ -2568,6 +2567,11 @@ void HandleUI(void)
 
 									user_io_status_set(opt, 1, ex);
 									user_io_status_set(opt, 0, ex);
+
+									// Notify RA only after the reset pulse: notifying before it
+									// leaves a window where an in-flight FPGA VBlank scan rewrites
+									// the response header after the ARM already cleared the mirror.
+									if (!bit) achievements_notify_core_reset();
 
 									menustate = MENU_GENERIC_MAIN1;
 									if (p[0] == 'R' || p[0] == 'r') menustate = MENU_NONE1;
@@ -2796,6 +2800,7 @@ void HandleUI(void)
 				if (!ioctl_index)
 				{
 					saturn_set_image(ioctl_index, selPath);
+					achievements_load_game(selPath, 0);
 				} else {
 					saturn_mount_save(selPath);
 				}

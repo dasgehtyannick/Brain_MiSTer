@@ -141,6 +141,7 @@ static int gba_poll(void *map, void *client, int game_loaded)
         } else {
                 // Normal frame processing from cache
                 uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+                optionc_resync_if_backward(&g_gba_state, resp_frame, "GBA");
                 if (resp_frame > g_gba_state.last_resp_frame) {
                         g_gba_state.last_resp_frame = resp_frame;
                         g_gba_state.game_frames++;

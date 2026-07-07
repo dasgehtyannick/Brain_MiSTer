@@ -74,4 +74,9 @@ int achievements_recollect_interval(void);
 int achievements_smart_cache_enabled(void);
 int achievements_n64_snapshot_enabled(void);
 
+// Debug watch list from retroachievements.cfg (watch=<hex>,<hex>,...).
+// Returns the count and sets *addrs to the RA-address array. Console handlers
+// log every per-frame value change of these addresses.
+int achievements_watch_list(const uint32_t **addrs);
+
 #endif // ACHIEVEMENTS_H

@@ -18,6 +18,7 @@ extern const console_handler_t g_console_megacd;
 extern const console_handler_t g_console_atari2600;
 extern const console_handler_t g_console_tgfx16;
 extern const console_handler_t g_console_s32x;
+extern const console_handler_t g_console_saturn;
 
 // Master lookup table
 static const console_handler_t *g_console_handlers[] = {
@@ -34,6 +35,7 @@ static const console_handler_t *g_console_handlers[] = {
 	&g_console_atari2600,
 	&g_console_tgfx16,
 	&g_console_s32x,
+	&g_console_saturn,
 	NULL
 };
 
@@ -126,6 +128,20 @@ int optionc_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
                 ra_snes_addrlist_init();
                 clock_gettime(CLOCK_MONOTONIC, &state->stall_time);
                 state->stall_frame = 0;
+                return 1;
+        }
+        return 0;
+}
+
+int optionc_resync_if_backward(console_state_t *state, uint32_t resp_frame,
+                                const char *console_name)
+{
+        if (resp_frame < state->last_resp_frame) {
+                ra_log_write("%s OptionC: resp_frame went backward (%u -> %u) -- FPGA reset without notify, resyncing\n",
+                        console_name, state->last_resp_frame, resp_frame);
+                state->last_resp_frame = resp_frame;
+                clock_gettime(CLOCK_MONOTONIC, &state->stall_time);
+                state->stall_frame = resp_frame;
                 return 1;
         }
         return 0;
