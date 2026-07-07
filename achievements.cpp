@@ -203,6 +203,12 @@ static int g_recollect_interval        = 600; // frames between address re-colle
 static int g_smart_cache               = -1; // -1 = default per console, 1 = smart cache: rtquery on cache miss, no periodic recollect
 static int g_n64_snapshot              = 0;  // 1 = snapshot RDRAM at VBlank for consistent reads
 static int g_multiline_desc            = 0;  // 1 = wrap long text to extra lines instead of truncating with "..."
+
+// Debug watch list (retroachievements.cfg: watch=19807d,19795a — RA addresses
+// in hex). Handlers log every value change of these addresses per frame.
+#define RA_WATCH_MAX 16
+static uint32_t g_watch_addrs[RA_WATCH_MAX];
+static int g_watch_count = 0;
 static char g_ua_clause[64]            = ""; // rcheevos user-agent clause (e.g. "rcheevos/11.6")
 static char g_fpga_core_version[8]     = "0.1"; // version reported by FPGA in DDRAM header
 
@@ -590,6 +596,17 @@ static int ra_load_credentials(void)
 			g_gba_reset_ram = atoi(val);
 		} else if (!strcasecmp(key, "multiline_desc")) {
 			g_multiline_desc = atoi(val);
+		} else if (!strcasecmp(key, "watch")) {
+			g_watch_count = 0;
+			const char *p = val;
+			while (*p && g_watch_count < RA_WATCH_MAX) {
+				char *end;
+				unsigned long a = strtoul(p, &end, 16);
+				if (end == p) break;
+				g_watch_addrs[g_watch_count++] = (uint32_t)a;
+				p = end;
+				while (*p == ',' || *p == ' ') p++;
+			}
 		}
 	}
 	fclose(f);
@@ -1865,6 +1882,12 @@ int achievements_smart_cache_enabled(void)
 int achievements_n64_snapshot_enabled(void)
 {
 	return g_n64_snapshot;
+}
+
+int achievements_watch_list(const uint32_t **addrs)
+{
+	if (addrs) *addrs = g_watch_addrs;
+	return g_watch_count;
 }
 
 void achievements_info(void)

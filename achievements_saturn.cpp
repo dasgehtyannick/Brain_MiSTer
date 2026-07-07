@@ -4,9 +4,10 @@
 //   RAML (Work RAM Low,  1MB): physical 0x30000000
 //   RAMH (Work RAM High, 1MB): physical 0x30300000
 //
-// Byte order: Saturn is big-endian. The ddram.sv arbiter stores data MSB
-// at the highest byte address within each 8-byte DDR3 word, so:
-//   rcheevos byte at offset K → DDR3 byte at offset (K ^ 7)
+// Byte order: Saturn is big-endian; the core's DDR3 stores SH-2 byte K at
+// offset K^7 (64-bit big-endian packing). RA sets are authored against
+// beetle-saturn, whose exposed WorkRAM stores SH-2 byte K at index K^1, so:
+//   rcheevos address A → DDR3 byte at offset (A^1)^7 = A ^ 6
 //
 // rcheevos Saturn memory map (RC_CONSOLE_SATURN = 39):
 //   0x000000–0x0FFFFF: Work RAM Low  (1MB)
@@ -47,8 +48,12 @@
 // ---------------------------------------------------------------------------
 
 static console_state_t g_saturn_state = {};
-static void *g_saturn_raml = NULL;  // mmap of physical 0x30000000, 256KB
+static void *g_saturn_raml = NULL;  // mmap of physical 0x30000000, 1MB
 static void *g_saturn_ramh = NULL;  // mmap of physical 0x30300000, 1MB
+
+// Debug watch (retroachievements.cfg: watch=...): last seen value per address
+static uint8_t g_watch_last[16];
+static int     g_watch_init = 0;
 
 // ---------------------------------------------------------------------------
 // Saturn implementation
@@ -83,6 +88,7 @@ static void saturn_init(void)
 static void saturn_reset(void)
 {
         memset(&g_saturn_state, 0, sizeof(g_saturn_state));
+        g_watch_init = 0;
         if (g_saturn_raml) {
                 shmem_unmap(g_saturn_raml, SATURN_RAML_SIZE);
                 g_saturn_raml = NULL;
@@ -102,18 +108,25 @@ static uint32_t saturn_read_memory(void *map, uint32_t address, uint8_t *buffer,
                 uint32_t addr = address + i;
                 uint8_t byte = 0;
 
+                // Byte order: RA sets are authored against beetle-saturn, whose
+                // exposed WorkRAM array stores SH-2 byte K at index K^1 (16-bit
+                // host swap, ne16_ptr_be). The core's DDR stores SH-2 byte K at
+                // offset K^7 (big-endian packing in 64-bit words). So RA addr A
+                // maps to DDR offset (A^1)^7 = A^6.
+                // (Proof: "Millionaire" scores = b[0x197c59]*25600 + b[0x197c58]*100
+                //  — high byte at the ODD address = beetle-swapped convention.)
                 if (addr <= SATURN_RA_RAML_END) {
-                        // Work RAM Low (256KB): XOR-7 big-endian byte swap
+                        // Work RAM Low (1MB)
                         if (g_saturn_raml) {
-                                uint32_t ddr_off = addr ^ 7;
+                                uint32_t ddr_off = addr ^ 6;
                                 if (ddr_off < SATURN_RAML_SIZE)
                                         byte = ((const uint8_t *)g_saturn_raml)[ddr_off];
                         }
                 } else if (addr >= SATURN_RA_RAMH_START && addr <= SATURN_RA_RAMH_END) {
-                        // Work RAM High (1MB): XOR-7 big-endian byte swap
+                        // Work RAM High (1MB)
                         if (g_saturn_ramh) {
                                 uint32_t k = addr - SATURN_RA_RAMH_START;
-                                uint32_t ddr_off = k ^ 7;
+                                uint32_t ddr_off = k ^ 6;
                                 if (ddr_off < SATURN_RAMH_SIZE)
                                         byte = ((const uint8_t *)g_saturn_ramh)[ddr_off];
                         }
@@ -155,6 +168,25 @@ static int saturn_poll(void *map, void *client, int game_loaded)
         if (g_saturn_state.game_frames <= 5)
                 ra_log_write("Saturn: Frame %u (fpga=%u)\n",
                         g_saturn_state.game_frames, frame);
+
+        // Debug watch: sample the configured RA addresses through the same
+        // read path rcheevos uses and log every change with the frame number.
+        {
+                const uint32_t *waddrs;
+                int wcount = achievements_watch_list(&waddrs);
+                if (wcount > 16) wcount = 16;
+                for (int i = 0; i < wcount; i++) {
+                        uint8_t v = 0;
+                        saturn_read_memory(NULL, waddrs[i], &v, 1);
+                        if (!g_watch_init || v != g_watch_last[i]) {
+                                ra_log_write("SAT WATCH f=%u 0x%06X: %02X->%02X\n",
+                                        frame, waddrs[i],
+                                        g_watch_init ? g_watch_last[i] : v, v);
+                                g_watch_last[i] = v;
+                        }
+                }
+                if (wcount) g_watch_init = 1;
+        }
 
         rc_client_do_frame(rc_client);
 
