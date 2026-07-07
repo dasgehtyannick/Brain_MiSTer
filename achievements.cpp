@@ -670,12 +670,15 @@ static void ra_server_call(const rc_api_request_t *request,
 {
 	(void)client;
 
-	// Log the request (mask token for security)
+	// Log the request (mask token and password for security)
 	if (request->post_data) {
 		const char *token_pos = strstr(request->post_data, "&t=");
-		if (token_pos) {
-			int prefix_len = (int)(token_pos - request->post_data);
-			RA_LOG("HTTP: POST %s [%.*s&t=***]", request->url, prefix_len, request->post_data);
+		const char *pass_pos  = strstr(request->post_data, "&p=");
+		const char *mask_pos  = token_pos ? token_pos : pass_pos;
+		const char *mask_key  = token_pos ? "&t=" : "&p=";
+		if (mask_pos) {
+			int prefix_len = (int)(mask_pos - request->post_data);
+			RA_LOG("HTTP: POST %s [%.*s%s***]", request->url, prefix_len, request->post_data, mask_key);
 		} else {
 			RA_LOG("HTTP: POST %s [%.80s%s]", request->url,
 				request->post_data, strlen(request->post_data) > 80 ? "..." : "");
@@ -1311,6 +1314,18 @@ void achievements_load_game(const char *rom_path, uint32_t crc32)
         RA_LOG("ROM path: %s", rom_path);
         RA_LOG("CRC32: %08X", crc32);
 
+#ifdef HAS_RCHEEVOS
+        // Switching game without a core restart: drop the previous rc_client
+        // session (also aborts an in-flight async load) before loading the new
+        // one, so unlock state/deltas from the old game can't leak into it.
+        if (g_client && (g_game_loaded || g_game_load_pending)) {
+                RA_LOG("Previous game session active -- unloading before new load");
+                rc_client_unload_game(g_client);
+                g_game_loaded = 0;
+                g_game_load_pending = 0;
+        }
+#endif
+
         // Store ROM path
         snprintf(g_rom_path, sizeof(g_rom_path), "%s", rom_path);
 
@@ -1324,6 +1339,18 @@ void achievements_load_game(const char *rom_path, uint32_t crc32)
                 } else {
                         extern const console_handler_t g_console_nes;
                         g_active_handler = &g_console_nes;
+                }
+        }
+
+        // Shared ATARI7800 core runs both consoles: .a78 ROMs use the 7800
+        // handler (4KB RAM mirror, ID 51), everything else the 2600 one (RIOT).
+        if (g_active_handler && (g_active_handler->console_id == 25 || g_active_handler->console_id == 51)) {
+                size_t len = strlen(rom_path);
+                if (len >= 4 && strcasecmp(rom_path + len - 4, ".a78") == 0) {
+                        g_active_handler = &g_console_atari7800;
+                        RA_LOG("A78 ROM detected, switching handler to Atari 7800 (ID 51)");
+                } else {
+                        g_active_handler = &g_console_atari2600;
                 }
         }
 

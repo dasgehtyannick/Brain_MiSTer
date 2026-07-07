@@ -165,6 +165,7 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 			}
 		} else {
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+			optionc_resync_if_backward(&g_gb_state, resp_frame, "GameBoy");
 
 			if (g_gb_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
 				g_gb_state.cache_reindexing = 0;
@@ -252,6 +253,7 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 	} else {
 		// Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+		optionc_resync_if_backward(&g_gb_state, resp_frame, "GameBoy");
 		if (resp_frame > g_gb_state.last_resp_frame) {
 			g_gb_state.last_resp_frame = resp_frame;
 			g_gb_state.game_frames++;

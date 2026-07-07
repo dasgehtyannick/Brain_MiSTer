@@ -92,6 +92,7 @@ static int sms_poll(void *map, void *client, int game_loaded)
 	} else {
 		// Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+		optionc_resync_if_backward(&g_sms_state, resp_frame, "SMS");
 		if (resp_frame > g_sms_state.last_resp_frame) {
 			g_sms_state.last_resp_frame = resp_frame;
 			g_sms_state.game_frames++;

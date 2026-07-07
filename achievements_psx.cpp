@@ -367,6 +367,7 @@ static int psx_poll(void *map, void *client, int game_loaded)
 		} else {
 			// Phase 3: Normal — cache miss handled in read_memory via rtquery
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+			optionc_resync_if_backward(&g_psx_state, resp_frame, "PSX");
 
 			// Check if FPGA responded after cleanup reindex
 			if (g_psx_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
@@ -556,6 +557,7 @@ static int psx_poll(void *map, void *client, int game_loaded)
 	} else {
 		// Phase 5: Normal frame processing
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+		optionc_resync_if_backward(&g_psx_state, resp_frame, "PSX");
 		if (resp_frame > g_psx_state.last_resp_frame) {
 			g_psx_state.last_resp_frame = resp_frame;
 			g_psx_state.game_frames++;

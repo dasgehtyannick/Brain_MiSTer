@@ -166,6 +166,7 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 			}
 		} else {
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+			optionc_resync_if_backward(&g_neogeo_state, resp_frame, "NeoGeo");
 
 			if (g_neogeo_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
 				g_neogeo_state.cache_reindexing = 0;
@@ -289,6 +290,7 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 	} else {
 		// Phase 5: Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+		optionc_resync_if_backward(&g_neogeo_state, resp_frame, "NeoGeo");
 		if (resp_frame > g_neogeo_state.last_resp_frame) {
 			g_neogeo_state.last_resp_frame = resp_frame;
 			g_neogeo_state.game_frames++;

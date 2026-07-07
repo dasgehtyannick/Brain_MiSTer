@@ -92,6 +92,7 @@ ra_log_write("S32X ADDRLIST[0..%d]: %s (total=%d)\n", ad - 1, ah, ac);
 } else {
 // Normal frame processing from cache
 uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
+optionc_resync_if_backward(&g_s32x_state, resp_frame, "S32X");
 if (resp_frame > g_s32x_state.last_resp_frame) {
 g_s32x_state.last_resp_frame = resp_frame;
 g_s32x_state.game_frames++;

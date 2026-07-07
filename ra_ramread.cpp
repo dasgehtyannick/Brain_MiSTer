@@ -206,13 +206,12 @@ uint8_t ra_ramread_atari7800_byte(const void *map, uint16_t addr)
 	// ram1: physical 0x1800-0x1FFF
 	if (addr >= 0x1800 && addr <= 0x1FFF)
 		return ((const uint8_t *)map + 0x900)[addr & 0x7FF];
-	// ram0: physical 0x2000-0x27FF (main) and zero-page/stack mirrors
-	// ProSystem (reference emulator for Atari 7800 achievements) stores game
-	// variables 8 bytes higher in BRAM than our FPGA. The -8 offset compensates.
-	// However, system/BIOS variables in BRAM[0x00-0x7F] map directly (no offset).
-	// Game variables in BRAM[0x80+] need the -8 shift.
-	// Example: RA addr 0x20C4 (bram=0xC4 >=0x80) -> BRAM[0xBC] = hammer timer.
-	//          RA addr 0x205B (bram=0x5B < 0x80) -> BRAM[0x5B] = 0 (no reset).
+	// ram0: physical 0x2000-0x27FF (main) and zero-page/stack mirrors.
+	// RA addresses are plain CPU addresses (identity map in rcheevos console 51),
+	// and the core decodes zero page $0040-$00FF / stack $0140-$01FF into the
+	// same BRAM via AB[10:0] (Maria/control.sv), so no offset is needed here.
+	// (A "-8"/"+1" skew observed in older tests came from a capture-latency bug
+	// in ra_7800_mirror.sv, fixed on the FPGA side — not from this mapping.)
 	if ((addr >= 0x2000 && addr <= 0x27FF) ||
 	    (addr >= 0x0040 && addr <= 0x00FF) ||
 	    (addr >= 0x0140 && addr <= 0x01FF)) {
@@ -318,6 +317,10 @@ static int      s_snes_addr_count = 0;
 static uint32_t s_snes_request_id = 0;
 static int      s_snes_collecting = 0;
 
+// Smart Cache dynamic-add state (see "Smart Cache" section below)
+static int s_dynamic_pending = 0;   // 1 if new addresses added since last flush
+static int s_dynamic_added   = 0;   // count of addresses added this cycle
+
 #define COLLECT_BUF_MAX (RA_SNES_MAX_ADDRS * 4)
 static uint32_t s_collect_buf[COLLECT_BUF_MAX];
 static int      s_collect_count = 0;
@@ -325,9 +328,17 @@ static int      s_collect_count = 0;
 void ra_snes_addrlist_init(void)
 {
 	s_snes_addr_count = 0;
-	s_snes_request_id = 0;
+	// s_snes_request_id is intentionally NOT reset here: it must stay monotonic
+	// for the lifetime of the process. On a core reset the FPGA can complete an
+	// in-flight VBlank scan (started before the reset pulse) and write a stale
+	// response header AFTER the ARM cleared the mirror. If request IDs restarted
+	// at 1, that stale response_id could match the fresh bootstrap request and
+	// poison last_resp_frame with a huge pre-reset frame counter, stalling
+	// achievement tracking until the counter catches up (hours).
 	s_snes_collecting = 0;
 	s_collect_count = 0;
+	s_dynamic_pending = 0;
+	s_dynamic_added = 0;
 }
 
 void ra_snes_addrlist_begin_collect(void)
@@ -484,10 +495,9 @@ void ra_snes_addrlist_diag_dump(const void *map)
 
 // ======================================================================
 // Smart Cache: incremental address management
+// (s_dynamic_pending / s_dynamic_added are declared next to the addrlist
+//  state above so ra_snes_addrlist_init can clear them.)
 // ======================================================================
-
-static int s_dynamic_pending = 0;   // 1 if new addresses added since last flush
-static int s_dynamic_added   = 0;   // count of addresses added this cycle
 
 int ra_snes_addrlist_contains(uint32_t addr)
 {
@@ -606,7 +616,10 @@ static uint8_t s_rtquery_seq = 0;
 
 void ra_rtquery_init(void *map)
 {
-        s_rtquery_seq = 0;
+        // s_rtquery_seq is intentionally NOT reset: it keeps counting (mod 256,
+        // skipping 0) across re-inits. Restarting at 1 after a core reset could
+        // collide with the sequence number the FPGA last latched, making it
+        // ignore the request and costing a full 100ms busy-wait timeout.
         if (!map) return;
 
         // Clear the control word so FPGA sees no pending request
