@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netdb.h>
@@ -273,8 +274,28 @@ static void *ra_play_thread(void *arg)
 {
 	(void)arg;
 	// Only play if the file exists — silent no-op otherwise
-	if (access(RA_SFX_PATH, R_OK) == 0)
-		system("aplay -q " RA_SFX_PATH " 2>/dev/null");
+	if (access(RA_SFX_PATH, R_OK) != 0) return NULL;
+
+	// fork/exec instead of system(): on cores built with MISTER_DISABLE_ALSA
+	// (e.g. N64, PSX) the FPGA never drains the ALSA ring buffer, so aplay
+	// blocks forever and every unlock would leak a process + thread. Kill it
+	// after a timeout instead.
+	pid_t pid = fork();
+	if (pid == 0) {
+		int fd = open("/dev/null", O_RDWR);
+		if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+		execlp("aplay", "aplay", "-q", RA_SFX_PATH, (char *)NULL);
+		_exit(127);
+	}
+	if (pid < 0) return NULL;
+
+	// The jingle lasts ~1s; allow 5s before declaring aplay stuck.
+	for (int i = 0; i < 50; i++) {
+		if (waitpid(pid, NULL, WNOHANG) == pid) return NULL;
+		usleep(100000);
+	}
+	kill(pid, SIGKILL);
+	waitpid(pid, NULL, 0);
 	return NULL;
 }
 
@@ -620,15 +641,45 @@ static void ra_format_text(const char *text, char *out, size_t out_size, int tru
 		for (int line = 0; line < max_lines && pos < len && written + 1 < out_size; line++) {
 			if (line > 0) { out[written++] = '\n'; out[written] = '\0'; }
 			size_t take = len - pos;
-			if (take > (size_t)wrap_width) take = (size_t)wrap_width;
+			if (take > (size_t)wrap_width) {
+				take = (size_t)wrap_width;
+				// Word wrap: if the cut lands inside a word, break at the last
+				// space instead so the whole word moves to the next line.
+				// (A single word longer than the line still hard-breaks.)
+				if (text[pos + take] != ' ') {
+					size_t s = take;
+					while (s > 0 && text[pos + s - 1] != ' ') s--;
+					if (s > 0) take = s;
+				}
+			}
 			size_t avail = out_size - written - 1;
 			if (take > avail) take = avail;
 			memcpy(out + written, text + pos, take);
+			// Drop trailing spaces from the line end
+			while (take > 0 && out[written + take - 1] == ' ') take--;
 			written += take;
 			out[written] = '\0';
 			pos += take;
+			// Skip spaces at the start of the next line
+			while (pos < len && text[pos] == ' ') pos++;
 		}
-		if (pos < len && written + 3 < out_size) strcat(out, "...");
+		if (pos < len && written + 3 < out_size) {
+			// The "..." must also fit in wrap_width: shrink the last line to
+			// wrap_width-3, preferring a word boundary.
+			size_t line_start = written;
+			while (line_start > 0 && out[line_start - 1] != '\n') line_start--;
+			size_t line_len = written - line_start;
+			if (line_len + 3 > (size_t)wrap_width) {
+				size_t keep = (size_t)wrap_width - 3;
+				size_t s = keep;
+				while (s > 0 && out[line_start + s - 1] != ' ') s--;
+				if (s > 0) keep = s;
+				while (keep > 0 && out[line_start + keep - 1] == ' ') keep--;
+				written = line_start + keep;
+				out[written] = '\0';
+			}
+			strcat(out, "...");
+		}
 	}
 }
 
