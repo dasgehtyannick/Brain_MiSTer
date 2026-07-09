@@ -79,4 +79,16 @@ int achievements_n64_snapshot_enabled(void);
 // log every per-frame value change of these addresses.
 int achievements_watch_list(const uint32_t **addrs);
 
+// 1 = dynamic-only smart-cache prune enabled (retroachievements.cfg:
+// smart_cleanup, default 1). Drops add_dynamic (AddAddress) entries ~1/min
+// when they pile up; the static bootstrap set is never pruned, and pruned
+// addresses that are still needed re-add themselves via rtquery misses.
+int achievements_smart_cleanup_enabled(void);
+
+// 1 = MegaDrive-only lightgun A/B test (retroachievements.cfg: justifier_test,
+// default 0): keeps the smart cache but caps the rtquery busy-wait (~1ms,
+// plus a 20ms fail-fast cooldown after a timeout) so no spin can delay
+// input forwarding.
+int achievements_justifier_test(void);
+
 #endif // ACHIEVEMENTS_H

@@ -173,30 +173,23 @@ static int nes_poll(void *map, void *client, int game_loaded)
 						g_nes_state.game_frames, resp_frame, ra_snes_addrlist_count());
 				}
 
-				// Periodic cleanup: prune stale entries every ~10s
-				int cleanup_frame = (g_nes_state.game_frames % 600 == 0)
-					&& (g_nes_state.game_frames > 0)
-					&& !g_nes_state.cache_reindexing;
-				if (cleanup_frame) {
-					g_nes_state.collecting = 1;
-					ra_snes_addrlist_begin_collect();
-				}
-
 				rc_client_do_frame(rc_client);
 
-				if (cleanup_frame) {
-					g_nes_state.collecting = 0;
-					int old_count = ra_snes_addrlist_count();
-					if (ra_snes_addrlist_end_collect(map)) {
-						int new_count = ra_snes_addrlist_count();
-						ra_log_write("NES SmartCache: Cleanup — pruned %d stale (%d -> %d)\n",
-							old_count - new_count, old_count, new_count);
+				// Dynamic-only prune (~1/min, only if dynamics piled up):
+				// static bootstrap addresses stay; still-needed dynamics
+				// re-add themselves via rtquery misses next frame.
+				if (achievements_smart_cleanup_enabled()
+						&& (g_nes_state.game_frames % 3600 == 0)
+						&& !g_nes_state.cache_reindexing
+						&& ra_snes_addrlist_dyn_count() > 128) {
+					int removed = ra_snes_addrlist_prune_dynamic(map);
+					if (removed) {
+						ra_log_write("NES SmartCache: pruned %d dynamic addrs (%d static kept)\n",
+							removed, ra_snes_addrlist_count());
 						g_nes_state.cache_reindexing = 1;
 					}
-				} else {
-					if (ra_snes_addrlist_has_pending()) {
-						ra_snes_addrlist_flush_dynamic(map);
-					}
+				} else if (ra_snes_addrlist_has_pending()) {
+					ra_snes_addrlist_flush_dynamic(map);
 				}
 			}
 		}

@@ -203,6 +203,8 @@ static int g_recollect_interval        = 600; // frames between address re-colle
 static int g_smart_cache               = -1; // -1 = default per console, 1 = smart cache: rtquery on cache miss, no periodic recollect
 static int g_n64_snapshot              = 0;  // 1 = snapshot RDRAM at VBlank for consistent reads
 static int g_multiline_desc            = 0;  // 1 = wrap long text to extra lines instead of truncating with "..."
+static int g_smart_cleanup             = 1;  // 1 = dynamic-only smart-cache prune (SNES/NES/MD): drops AddAddress targets ~1/min; statics never pruned
+static int g_justifier_test            = 0;  // 1 = MegaDrive only: cap rtquery busy-wait (~1ms + fail-fast) to A/B test lightgun input latency
 
 // Debug watch list (retroachievements.cfg: watch=19807d,19795a — RA addresses
 // in hex). Handlers log every value change of these addresses per frame.
@@ -596,6 +598,10 @@ static int ra_load_credentials(void)
 			g_gba_reset_ram = atoi(val);
 		} else if (!strcasecmp(key, "multiline_desc")) {
 			g_multiline_desc = atoi(val);
+		} else if (!strcasecmp(key, "smart_cleanup")) {
+			g_smart_cleanup = atoi(val);
+		} else if (!strcasecmp(key, "justifier_test")) {
+			g_justifier_test = atoi(val);
 		} else if (!strcasecmp(key, "watch")) {
 			g_watch_count = 0;
 			const char *p = val;
@@ -623,11 +629,11 @@ static int ra_load_credentials(void)
 	}
 
 	RA_LOG("Credentials loaded: user=%s password=***(%zu chars)", g_ra_user, strlen(g_ra_password));
-	RA_LOG("Config: show_challenge_show=%d show_challenge_hide=%d show_progress=%d show_progress_name=%d show_leaderboards_updates=%d show_leaderboards_submission=%d leaderboards_enabled(deprecated)=%d hardcore=%d force_hardcore=%d stall_recovery=%d rtquery=%d recollect=%d smart_cache=%d n64_snapshot=%d gba_reset_ram=%d multiline_desc=%d debug=%d",
+	RA_LOG("Config: show_challenge_show=%d show_challenge_hide=%d show_progress=%d show_progress_name=%d show_leaderboards_updates=%d show_leaderboards_submission=%d leaderboards_enabled(deprecated)=%d hardcore=%d force_hardcore=%d stall_recovery=%d rtquery=%d recollect=%d smart_cache=%d smart_cleanup=%d justifier_test=%d n64_snapshot=%d gba_reset_ram=%d multiline_desc=%d debug=%d",
                 g_show_challenge_show_popup, g_show_challenge_hide_popup,
                 g_show_progress_popups, g_show_progress_name,
 		g_show_leaderboards_updates, g_show_leaderboards_submission, g_leaderboards_enabled,
-                g_hardcore, g_force_hardcore, g_stall_recovery, g_rtquery_enabled, g_recollect_interval, g_smart_cache, g_n64_snapshot, g_gba_reset_ram, g_multiline_desc, g_ra_debug);
+                g_hardcore, g_force_hardcore, g_stall_recovery, g_rtquery_enabled, g_recollect_interval, g_smart_cache, g_smart_cleanup, g_justifier_test, g_n64_snapshot, g_gba_reset_ram, g_multiline_desc, g_ra_debug);
 	return 1;
 }
 
@@ -1161,6 +1167,13 @@ static void ra_load_game_callback(int result, const char *error_message,
 			error_message ? error_message : "(none)");
 		if (result == RC_NO_GAME_LOADED) {
 			RA_LOG("This ROM is not in the RetroAchievements database.");
+			// Generic warning for every console: the loaded dump's hash is
+			// not in the RA database (bad dump, ROM hack or unsupported
+			// region/revision) — achievements will not track.
+			ra_notify_urgent("RetroAchievements\n\n"
+				"Game not recognized:\n"
+				"this dump is not in the\n"
+				"RA database", 4000);
 		}
 	}
 }
@@ -1888,6 +1901,16 @@ int achievements_watch_list(const uint32_t **addrs)
 {
 	if (addrs) *addrs = g_watch_addrs;
 	return g_watch_count;
+}
+
+int achievements_smart_cleanup_enabled(void)
+{
+	return g_smart_cleanup;
+}
+
+int achievements_justifier_test(void)
+{
+	return g_justifier_test;
 }
 
 void achievements_info(void)
