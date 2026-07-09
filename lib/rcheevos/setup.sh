@@ -3,11 +3,11 @@
 # Run this script from the Main_MiSTer/lib/rcheevos/ directory.
 #
 # Usage: ./setup.sh [version]
-#   version: git tag (default: v11.6.0)
+#   version: git tag (default: v12.3.0)
 
 set -e
 
-VERSION="${1:-v11.6.0}"
+VERSION="${1:-v12.3.0}"
 REPO="https://github.com/RetroAchievements/rcheevos.git"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

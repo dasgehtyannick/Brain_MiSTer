@@ -824,7 +824,7 @@ static void ra_server_call(const rc_api_request_t *request,
 		free(br);
 	};
 
-	ra_http_request(request->url, request->post_data, NULL,
+	ra_http_request(request->url, request->post_data, request->content_type,
 		http_done, bridge);
 }
 
@@ -1047,6 +1047,24 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 		ra_play_achievement_sound();
 		break;
 
+	case RC_CLIENT_EVENT_SUBSET_COMPLETED:
+		{
+			// Per rc_client integration guide: "Completed" in softcore,
+			// "Mastered" in hardcore.
+			const char *verb = rc_client_get_hardcore_enabled(client) ?
+				"MASTERED" : "COMPLETED";
+			const char *title = (event->subset && event->subset->title) ?
+				event->subset->title : "(unknown subset)";
+			RA_LOG("*** SUBSET %s: %s ***", verb, title);
+			char title_buf[96];
+			ra_format_text(title, title_buf, sizeof(title_buf), 28, 28, 2);
+			char buf[NOTIF_TEXT_MAX];
+			snprintf(buf, sizeof(buf), "** SUBSET %s! **\n\n%s", verb, title_buf);
+			ra_notify_urgent(buf, 5000);
+			ra_play_achievement_sound();
+		}
+		break;
+
 	case RC_CLIENT_EVENT_SERVER_ERROR:
 		{
 			RA_LOG("SERVER ERROR: %s", event->server_error->error_message);
@@ -1122,6 +1140,23 @@ static void ra_load_game_callback(int result, const char *error_message,
 		RA_LOG("  ROM: %s", g_rom_path);
 		RA_LOG("  MD5: %s", g_rom_md5);
 		g_game_loaded = 1;
+
+		// Multiset (rcheevos 12+): the server decides which subsets are
+		// attached to this game/user; rc_client loads them automatically.
+		// Log them so it's visible which sets are active.
+		{
+			rc_client_subset_list_t *subsets = rc_client_create_subset_list(client);
+			if (subsets) {
+				RA_LOG("  Subsets: %u", subsets->num_subsets);
+				for (uint32_t s = 0; s < subsets->num_subsets; s++) {
+					const rc_client_subset_t *ss = subsets->subsets[s];
+					RA_LOG("    [%u] %s (%u achievements, %u leaderboards)",
+						ss->id, ss->title, ss->num_achievements,
+						ss->num_leaderboards);
+				}
+				rc_client_destroy_subset_list(subsets);
+			}
+		}
 
 		{
 			// Single combined popup: game title + achievement count + logged-in user
