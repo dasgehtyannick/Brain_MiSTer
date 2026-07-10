@@ -1161,26 +1161,57 @@ static void ra_load_game_callback(int result, const char *error_message,
 		{
 			// Single combined popup: game title + achievement count + logged-in user
 			char buf[NOTIF_TEXT_MAX];
-			// Count achievements via the list API
+			// Count achievements per set. LOCK_STATE buckets are per-subset
+			// in rcheevos 12 (bucket->subset_id), so multiset games can show
+			// the main set's count separately instead of one summed number.
+			enum { MAX_SETS_SHOWN = 8 };
+			uint32_t per_set[MAX_SETS_SHOWN] = {0};
+			uint32_t nsets = 1;
+			uint32_t total = 0;
 			rc_client_achievement_list_t *list =
 				rc_client_create_achievement_list(client,
 					RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
-					RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_PROGRESS);
-			uint32_t total = 0;
+					RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+			rc_client_subset_list_t *subsets = rc_client_create_subset_list(client);
+			if (subsets && subsets->num_subsets > 1)
+				nsets = subsets->num_subsets;
 			if (list) {
-				for (uint32_t b = 0; b < list->num_buckets; b++)
+				for (uint32_t b = 0; b < list->num_buckets; b++) {
 					total += list->buckets[b].num_achievements;
+					if (nsets > 1) {
+						for (uint32_t s = 0; s < nsets && s < MAX_SETS_SHOWN; s++) {
+							if (list->buckets[b].subset_id == subsets->subsets[s]->id) {
+								per_set[s] += list->buckets[b].num_achievements;
+								break;
+							}
+						}
+					}
+				}
 				rc_client_destroy_achievement_list(list);
 			}
+			if (subsets)
+				rc_client_destroy_subset_list(subsets);
 			const rc_client_user_t *user = rc_client_get_user_info(client);
 			int hardcore_enabled = rc_client_get_hardcore_enabled(client);
 			if (user) {
 				snprintf(buf, sizeof(buf),
-					"%s\n(HC:%u SC:%u)",					
+					"%s\n(HC:%u SC:%u)",
 					user->display_name, user->score, user->score_softcore);
 				ra_notify_urgent(buf, 2000);
 			}
-			if (total > 0) {
+			if (total > 0 && nsets > 1) {
+				// e.g. "93 achievements\n+2 sets (84, 10)"
+				char sets_buf[48];
+				int pos = 0;
+				for (uint32_t s = 1; s < nsets && s < MAX_SETS_SHOWN; s++) {
+					pos += snprintf(sets_buf + pos, sizeof(sets_buf) - pos,
+						"%s%u", (s > 1) ? ", " : "", per_set[s]);
+					if (pos >= (int)sizeof(sets_buf) - 1) break;
+				}
+				snprintf(buf, sizeof(buf),
+					"%s\n%u achievements\n+%u sets (%s)",
+					game->title, per_set[0], nsets - 1, sets_buf);
+			} else if (total > 0) {
 				snprintf(buf, sizeof(buf),
 					"%s\n%u achievements",
 					game->title, total);
