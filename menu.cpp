@@ -1212,9 +1212,6 @@ void HandleUI(void)
 		c = menu_key_get();
 	}
 
-	int release = 0;
-	if (c & UPSTROKE) release = 1;
-
 	// decode and set events
 	menu = false;
 	back = false;
@@ -1234,8 +1231,15 @@ void HandleUI(void)
 		static int menu_visible = 1;
 		static unsigned long timeout = 0;
 		static unsigned long off_timeout = 0;
+		static uint32_t wake_release = 0;
 		if (!video_fb_state() && cfg.fb_terminal)
 		{
+			if (c == wake_release)
+			{
+				wake_release = 0;
+				c = 0;
+			}
+
 			if (timeout && CheckTimer(timeout))
 			{
 				timeout = 0;
@@ -1265,6 +1269,7 @@ void HandleUI(void)
 				timeout = 0;
 				if (menu_visible <= 0)
 				{
+					wake_release = c | UPSTROKE;
 					c = 0;
 					menu_visible = 1;
 					video_menu_bg(user_io_status_get("[3:1]"));
@@ -5549,7 +5554,7 @@ void HandleUI(void)
 			}
 		}
 
-		if (release) PrintDirectory(1);
+		if (c & UPSTROKE) PrintDirectory(1);
 		break;
 
 		/******************************************************************/
