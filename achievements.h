@@ -65,6 +65,11 @@ void achievements_list_print(void);
 // Returns the total count in the currently open list (0 if not open).
 int achievements_list_count(void);
 
+// Switch the list view to the previous/next achievement set (dir = -1/+1)
+// of a multiset game (rcheevos 12+). Returns 1 if the view changed,
+// 0 for single-set games (caller should fall back to page scrolling).
+int achievements_list_switch_set(int dir);
+
 // Update global frame counters (called by per-console poll handlers)
 void ra_frame_processed(uint32_t frame);
 int achievements_stall_recovery_enabled(void);

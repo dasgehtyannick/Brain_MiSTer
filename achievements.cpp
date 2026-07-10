@@ -2044,10 +2044,31 @@ struct AchViewItem {
 };
 static rc_client_achievement_list_t *g_ach_view_list = nullptr;
 static AchViewItem *g_ach_view_items = nullptr;
+static rc_client_subset_list_t *g_ach_view_subsets = nullptr;
 #endif
 static int g_ach_view_first    = 0;
 static int g_ach_view_selected = 0;
 static int g_ach_view_total    = 0;
+static int g_ach_view_set_idx  = 0;
+
+// Number of achievement sets (subsets) of the loaded game. Multiset games
+// (rcheevos 12+) get one list page per set, switched with Left/Right.
+static int ra_ach_view_num_sets(void)
+{
+#ifdef HAS_RCHEEVOS
+	if (g_ach_view_subsets) return (int)g_ach_view_subsets->num_subsets;
+#endif
+	return 1;
+}
+
+// OSD rows available for list items; the set-selector footer takes the
+// last row when the game has more than one set.
+static int ra_ach_view_rows(void)
+{
+	int rows = OsdGetSize();
+	if (ra_ach_view_num_sets() > 1) rows--;
+	return rows;
+}
 
 int achievements_has_active_game(void)
 {
@@ -2058,22 +2079,29 @@ int achievements_has_active_game(void)
 #endif
 }
 
-int achievements_list_open(void)
-{
-	achievements_list_close();
 #ifdef HAS_RCHEEVOS
-	if (!g_client || !g_logged_in || !g_game_loaded)
-		return 0;
+// (Re)build the flattened item array for the currently selected set.
+// In multiset games the LOCK_STATE buckets are per-subset (bucket->subset_id
+// is non-zero); only buckets of the selected set are taken.
+static void ra_ach_view_build(void)
+{
+	if (g_ach_view_items) {
+		delete[] g_ach_view_items;
+		g_ach_view_items = nullptr;
+	}
+	g_ach_view_total    = 0;
+	g_ach_view_first    = 0;
+	g_ach_view_selected = 0;
 
-	// Use LOCK_STATE grouping to get all achievements, we will categorize them manually
-	g_ach_view_list = rc_client_create_achievement_list(g_client,
-		RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
-		RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
 	if (!g_ach_view_list)
-		return 0;
+		return;
+
+	const uint32_t cur_set_id = (ra_ach_view_num_sets() > 1) ?
+		g_ach_view_subsets->subsets[g_ach_view_set_idx]->id : 0;
 
 	uint32_t total_ach = 0;
 	for (uint32_t b = 0; b < g_ach_view_list->num_buckets; b++) {
+		if (g_ach_view_list->buckets[b].subset_id != cur_set_id) continue;
 		total_ach += g_ach_view_list->buckets[b].num_achievements;
 	}
 
@@ -2084,6 +2112,7 @@ int achievements_list_open(void)
 	int n_active = 0, n_prog = 0, n_locked = 0, n_unlocked = 0;
 
 	for (uint32_t b = 0; b < g_ach_view_list->num_buckets; b++) {
+		if (g_ach_view_list->buckets[b].subset_id != cur_set_id) continue;
 		for (uint32_t a = 0; a < g_ach_view_list->buckets[b].num_achievements; a++) {
 			const rc_client_achievement_t* ach = g_ach_view_list->buckets[b].achievements[a];
 			if (ach->state == RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED) {
@@ -2176,12 +2205,45 @@ int achievements_list_open(void)
 	delete[] achs_unlocked;
 
 	g_ach_view_total = (int)total_items;
-#else
-	g_ach_view_total = 0;
+}
+#endif // HAS_RCHEEVOS
+
+int achievements_list_open(void)
+{
+	achievements_list_close();
+#ifdef HAS_RCHEEVOS
+	if (!g_client || !g_logged_in || !g_game_loaded)
+		return 0;
+
+	// Use LOCK_STATE grouping to get all achievements, we will categorize them manually
+	g_ach_view_list = rc_client_create_achievement_list(g_client,
+		RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE,
+		RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
+	if (!g_ach_view_list)
+		return 0;
+
+	g_ach_view_subsets = rc_client_create_subset_list(g_client);
+	g_ach_view_set_idx = 0;
+	ra_ach_view_build();
 #endif
-	g_ach_view_first    = 0;
-	g_ach_view_selected = 0;
 	return g_ach_view_total;
+}
+
+// Switch the list view to the previous/next achievement set (dir = -1/+1).
+// Returns 1 if the view changed, 0 for single-set games (caller falls back
+// to page scrolling so Left/Right keep their old behavior).
+int achievements_list_switch_set(int dir)
+{
+#ifdef HAS_RCHEEVOS
+	int n = ra_ach_view_num_sets();
+	if (n <= 1) return 0;
+	g_ach_view_set_idx = (g_ach_view_set_idx + (dir < 0 ? n - 1 : 1)) % n;
+	ra_ach_view_build();
+	return 1;
+#else
+	(void)dir;
+	return 0;
+#endif
 }
 
 void achievements_list_close(void)
@@ -2195,10 +2257,15 @@ void achievements_list_close(void)
 		rc_client_destroy_achievement_list(g_ach_view_list);
 		g_ach_view_list = nullptr;
 	}
+	if (g_ach_view_subsets) {
+		rc_client_destroy_subset_list(g_ach_view_subsets);
+		g_ach_view_subsets = nullptr;
+	}
 #endif
 	g_ach_view_first    = 0;
 	g_ach_view_selected = 0;
 	g_ach_view_total    = 0;
+	g_ach_view_set_idx  = 0;
 }
 
 int achievements_list_count(void)
@@ -2209,7 +2276,7 @@ int achievements_list_count(void)
 void achievements_list_scan(int mode)
 {
 	int total    = g_ach_view_total;
-	int osd_size = OsdGetSize();
+	int osd_size = ra_ach_view_rows();
 	if (total == 0) return;
 
 	switch (mode) {
@@ -2256,7 +2323,7 @@ void achievements_list_print(void)
 {
 	static char s[32];
 	int total    = g_ach_view_total;
-	int osd_size = OsdGetSize();
+	int osd_size = ra_ach_view_rows();
 
 	for (int i = 0; i < osd_size; i++) {
 		int idx      = g_ach_view_first + i;
@@ -2310,4 +2377,16 @@ void achievements_list_print(void)
 
 		OsdWriteOffset(i, s, (idx == g_ach_view_selected), 0, 0, leftchar);
 	}
+
+#ifdef HAS_RCHEEVOS
+	// Multiset footer: set name + Left/Right arrows on the last OSD row.
+	if (ra_ach_view_num_sets() > 1) {
+		const rc_client_subset_t *set =
+			g_ach_view_subsets->subsets[g_ach_view_set_idx];
+		snprintf(s, 30, "\x11 %d/%d %-21.21s \x10",
+			g_ach_view_set_idx + 1, ra_ach_view_num_sets(),
+			(set && set->title) ? set->title : "");
+		OsdWriteOffset(osd_size, s, 0, 0, 0, 0);
+	}
+#endif
 }

@@ -5665,15 +5665,29 @@ void HandleUI(void)
 			menustate = MENU_RA_ACHIEVEMENTS1;
 		}
 
-		if ((c == KEY_PAGEUP) || (c == KEY_LEFT))
+		if (c == KEY_PAGEUP)
 		{
 			achievements_list_scan(SCANF_PREV_PAGE);
 			menustate = MENU_RA_ACHIEVEMENTS1;
 		}
 
-		if ((c == KEY_PAGEDOWN) || (c == KEY_RIGHT))
+		if (c == KEY_PAGEDOWN)
 		{
 			achievements_list_scan(SCANF_NEXT_PAGE);
+			menustate = MENU_RA_ACHIEVEMENTS1;
+		}
+
+		// Multiset games: Left/Right switch between achievement sets.
+		// Single-set games: keep the old page-scroll behavior.
+		if (c == KEY_LEFT)
+		{
+			if (!achievements_list_switch_set(-1)) achievements_list_scan(SCANF_PREV_PAGE);
+			menustate = MENU_RA_ACHIEVEMENTS1;
+		}
+
+		if (c == KEY_RIGHT)
+		{
+			if (!achievements_list_switch_set(1)) achievements_list_scan(SCANF_NEXT_PAGE);
 			menustate = MENU_RA_ACHIEVEMENTS1;
 		}
 
