@@ -313,6 +313,8 @@ static int s_addr_cmp(const void *a, const void *b)
 }
 
 static uint32_t s_snes_addrs[RA_SNES_MAX_ADDRS];
+static uint8_t  s_snes_addr_dyn[RA_SNES_MAX_ADDRS]; // 1 = added via add_dynamic (AddAddress target)
+static int      s_snes_dyn_count = 0;               // how many entries have the dyn flag
 static int      s_snes_addr_count = 0;
 static uint32_t s_snes_request_id = 0;
 static int      s_snes_collecting = 0;
@@ -339,6 +341,7 @@ void ra_snes_addrlist_init(void)
 	s_collect_count = 0;
 	s_dynamic_pending = 0;
 	s_dynamic_added = 0;
+	s_snes_dyn_count = 0;
 }
 
 void ra_snes_addrlist_begin_collect(void)
@@ -380,8 +383,10 @@ int ra_snes_addrlist_end_collect(void *map)
 	}
 	if (!changed) return 0;
 
-	// Update local list
+	// Update local list — a full collect defines the STATIC baseline
 	memcpy(s_snes_addrs, s_collect_buf, new_count * sizeof(uint32_t));
+	memset(s_snes_addr_dyn, 0, (size_t)new_count);
+	s_snes_dyn_count = 0;
 	s_snes_addr_count = new_count;
 	s_snes_request_id++;
 
@@ -553,18 +558,24 @@ int ra_snes_addrlist_add_dynamic(uint32_t addr)
 			insert_pos = lo;
 		if (s_snes_addr_count >= RA_SNES_MAX_ADDRS) return 0; // list full
 
-		// Insert at sorted position
+		// Insert at sorted position (dyn flags move in lockstep)
 		if (insert_pos < s_snes_addr_count) {
 			memmove(&s_snes_addrs[insert_pos + 1],
 				&s_snes_addrs[insert_pos],
 				(s_snes_addr_count - insert_pos) * sizeof(uint32_t));
+			memmove(&s_snes_addr_dyn[insert_pos + 1],
+				&s_snes_addr_dyn[insert_pos],
+				(size_t)(s_snes_addr_count - insert_pos));
 		}
 		s_snes_addrs[insert_pos] = addr;
+		s_snes_addr_dyn[insert_pos] = 1;
 	} else {
 		if (s_snes_addr_count >= RA_SNES_MAX_ADDRS) return 0;
 		s_snes_addrs[0] = addr;
+		s_snes_addr_dyn[0] = 1;
 	}
 	s_snes_addr_count++;
+	s_snes_dyn_count++;
 	s_dynamic_pending = 1;
 	s_dynamic_added++;
 	return 1;
@@ -608,11 +619,78 @@ int ra_snes_addrlist_dynamic_count(void)
 	return s_dynamic_added;
 }
 
+int ra_snes_addrlist_dyn_count(void)
+{
+	return s_snes_dyn_count;
+}
+
+// Dynamic-only cleanup: drop every address added via add_dynamic (AddAddress
+// pointer targets), keeping the static bootstrap set untouched. Safe by
+// construction: a pruned address that is still needed simply misses the cache
+// on the next frame, is answered by rtquery and re-added. Much cheaper than a
+// full re-collect (no extra rc_client_do_frame pass, no qsort).
+// Returns the number of entries removed (0 = nothing to do, list unchanged).
+int ra_snes_addrlist_prune_dynamic(void *map)
+{
+	if (!s_snes_dyn_count) return 0;
+	// Never prune down to an empty list (all-dynamic lists would break the
+	// is_ready/reindex handshake); keep everything instead.
+	if (s_snes_dyn_count >= s_snes_addr_count) return 0;
+
+	int w = 0;
+	for (int i = 0; i < s_snes_addr_count; i++) {
+		if (!s_snes_addr_dyn[i]) {
+			s_snes_addrs[w] = s_snes_addrs[i];
+			s_snes_addr_dyn[w] = 0;
+			w++;
+		}
+	}
+	int removed = s_snes_addr_count - w;
+	s_snes_addr_count = w;
+	s_snes_dyn_count = 0;
+	s_dynamic_pending = 0;
+	s_dynamic_added = 0;
+
+	// Publish the shrunk list (same commit order as flush_dynamic)
+	s_snes_request_id++;
+	if (map) {
+		uint8_t *base = (uint8_t *)map;
+		uint32_t *addrs = (uint32_t *)(base + RA_SNES_ADDRLIST_OFFSET + 8);
+		memcpy(addrs, s_snes_addrs, s_snes_addr_count * sizeof(uint32_t));
+		__sync_synchronize();
+		ra_addr_req_hdr_t *hdr = (ra_addr_req_hdr_t *)(base + RA_SNES_ADDRLIST_OFFSET);
+		hdr->addr_count = s_snes_addr_count;
+		__sync_synchronize();
+		hdr->request_id = s_snes_request_id;
+		__sync_synchronize();
+	}
+
+	RA_DBG("DynPrune: removed %d dynamic addrs, %d static kept, request_id=%u",
+		removed, s_snes_addr_count, s_snes_request_id);
+	return removed;
+}
+
 // ======================================================================
 // Realtime Query Mailbox (Option C "on steroids")
 // ======================================================================
 
 static uint8_t s_rtquery_seq = 0;
+
+// Busy-wait budget: iterations to spin waiting for the FPGA response.
+// Default keeps the historical ~100k (worst case tens of ms). Handlers can
+// lower it (e.g. justifier_test caps it to ~2k ≈ 0.5-1ms) so a mailbox
+// timeout can never hold the main loop long enough to lag input forwarding.
+static int s_rtquery_spin_limit = 100000;
+
+// Cooldown after a timeout: skip further queries briefly instead of
+// re-spinning on every read (one dead mailbox must not become a stall storm).
+static struct timespec s_rtq_cooldown = {0, 0};
+
+void ra_rtquery_set_spin_limit(int iters)
+{
+	s_rtquery_spin_limit = (iters > 0) ? iters : 100000;
+	RA_DBG("RTQuery: spin limit set to %d iterations", s_rtquery_spin_limit);
+}
 
 void ra_rtquery_init(void *map)
 {
@@ -667,6 +745,18 @@ uint32_t ra_rtquery_read(void *map, uint32_t address, uint32_t num_bytes)
 {
         if (!map || num_bytes == 0 || num_bytes > 4) return 0;
 
+        // Inside a post-timeout cooldown window: fail fast (returns 0, which
+        // the smart cache treats as a plain miss).
+        if (s_rtq_cooldown.tv_sec) {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (now.tv_sec < s_rtq_cooldown.tv_sec ||
+                    (now.tv_sec == s_rtq_cooldown.tv_sec && now.tv_nsec < s_rtq_cooldown.tv_nsec))
+                        return 0;
+                s_rtq_cooldown.tv_sec = 0;
+                s_rtq_cooldown.tv_nsec = 0;
+        }
+
         uint8_t *base = (uint8_t *)map;
         ra_query_ctrl_t *ctrl = (ra_query_ctrl_t *)(base + RA_QUERY_CTRL_OFFSET);
         ra_query_req_t  *req  = (ra_query_req_t *)(base + RA_QUERY_REQ_OFFSET);
@@ -687,13 +777,19 @@ uint32_t ra_rtquery_read(void *map, uint32_t address, uint32_t num_bytes)
 
         // Busy-wait for FPGA response (typically 5-50µs)
         volatile ra_query_ctrl_t *vctrl = (volatile ra_query_ctrl_t *)ctrl;
-        int timeout = 100000;  // ~100ms safety limit at ~1µs per iteration
+        int timeout = s_rtquery_spin_limit;
         while (vctrl->response_seq != s_rtquery_seq && --timeout > 0) {
                 // Spin
         }
 
         if (timeout <= 0) {
-                // Timeout — FPGA didn't respond
+                // Timeout — FPGA didn't respond. Enter a 20ms cooldown so the
+                // main loop is not held by back-to-back dead queries.
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                now.tv_nsec += 20000000L;
+                if (now.tv_nsec >= 1000000000L) { now.tv_sec++; now.tv_nsec -= 1000000000L; }
+                s_rtq_cooldown = now;
                 return 0;
         }
 

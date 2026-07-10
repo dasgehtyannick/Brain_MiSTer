@@ -224,6 +224,14 @@ int      ra_snes_addrlist_add_dynamic(uint32_t addr);    // Insert in sorted pos
 int      ra_snes_addrlist_has_pending(void);              // 1 if new dynamic addresses need flush
 int      ra_snes_addrlist_flush_dynamic(void *map);      // Write updated list to DDRAM, returns 1 if flushed
 int      ra_snes_addrlist_dynamic_count(void);            // Number of addresses added dynamically this cycle
+int      ra_snes_addrlist_dyn_count(void);                // Total entries currently flagged as dynamic
+// Dynamic-only cleanup: removes every add_dynamic entry (static bootstrap set
+// stays). Pruned-but-still-needed addresses re-add themselves via rtquery
+// misses. Returns entries removed (0 = list unchanged, no reindex needed).
+int      ra_snes_addrlist_prune_dynamic(void *map);
+// Cap the rtquery busy-wait (iterations). <=0 restores the 100k default.
+// On timeout a 20ms cooldown suppresses further queries (fail-fast).
+void     ra_rtquery_set_spin_limit(int iters);
 
 // Print a full diagnostic dump of the DDRAM mirror state to stdout and optional log file.
 // Includes: header validation, frame counter, region descriptors, hex dump of first bytes.
