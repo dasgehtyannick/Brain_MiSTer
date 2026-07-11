@@ -369,5 +369,6 @@ const console_handler_t g_console_gameboy = {
 	.set_hardcore = gameboy_set_hardcore,
 	.detect_protocol = gameboy_detect_protocol,
 	.console_id = 4,  // RC_CONSOLE_GAMEBOY (also handles GBC with ID 6)
-	.name = "GAMEBOY"
+	.name = "GAMEBOY",
+	.hardcore_protected = 0
 };

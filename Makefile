@@ -30,7 +30,7 @@ INCLUDE += -I./lib/serial_server/library
 RCHEEVOS_DIR = ./lib/rcheevos
 ifneq ($(wildcard $(RCHEEVOS_DIR)/include/rc_client.h),)
   INCLUDE += -I$(RCHEEVOS_DIR)/include -I$(RCHEEVOS_DIR)/src -I$(RCHEEVOS_DIR)/src/rcheevos
-  RCHEEVOS_DFLAGS = -DHAS_RCHEEVOS=1 -DRC_DISABLE_LUA=1
+  RCHEEVOS_DFLAGS = -DHAS_RCHEEVOS=1
   RCHEEVOS_SRC = \
     $(RCHEEVOS_DIR)/src/rc_client.c \
     $(RCHEEVOS_DIR)/src/rc_compat.c \
@@ -55,6 +55,10 @@ ifneq ($(wildcard $(RCHEEVOS_DIR)/include/rc_client.h),)
     $(RCHEEVOS_DIR)/src/rapi/rc_api_user.c \
     $(RCHEEVOS_DIR)/src/rhash/md5.c \
     $(RCHEEVOS_DIR)/src/rhash/hash.c \
+    $(RCHEEVOS_DIR)/src/rhash/hash_disc.c \
+    $(RCHEEVOS_DIR)/src/rhash/hash_encrypted.c \
+    $(RCHEEVOS_DIR)/src/rhash/hash_rom.c \
+    $(RCHEEVOS_DIR)/src/rhash/hash_zip.c \
     $(RCHEEVOS_DIR)/src/rhash/cdreader.c \
     $(RCHEEVOS_DIR)/src/rhash/aes.c
   $(info rcheevos library found — building with RetroAchievements support)

@@ -193,14 +193,20 @@ static uint32_t ra_chd_first_track_sector(void* handle)
 }
 
 // ── Unified dispatcher: CHD takes priority, .cue/.gdi goes to default ──────
-static void* ra_unified_open_track(const char* path, uint32_t track_id)
+// rcheevos 12: the default cdreader only provides the iterator-based open
+// handler (open_track is NULL), so the dispatcher must be registered as
+// open_track_iterator and pass the iterator through when delegating.
+static void* ra_unified_open_track_iterator(const char* path, uint32_t track_id,
+                                            const struct rc_hash_iterator* iterator)
 {
     if (path_is_chd(path))
         return ra_chd_open_track(path, track_id);
 
-    if (!s_default.open_track) return NULL;
-
-    void* inner = s_default.open_track(path, track_id);
+    void* inner = NULL;
+    if (s_default.open_track_iterator)
+        inner = s_default.open_track_iterator(path, track_id, iterator);
+    else if (s_default.open_track)
+        inner = s_default.open_track(path, track_id);
     if (!inner) return NULL;
 
     ra_default_handle* h = (ra_default_handle*)malloc(sizeof(ra_default_handle));
@@ -244,13 +250,17 @@ static uint32_t ra_unified_first_track_sector(void* handle)
 void ra_cdreader_chd_register(void)
 {
     // Save the default (cue/gdi) handlers so we can delegate to them
+    memset(&s_default, 0, sizeof(s_default));
     rc_hash_get_default_cdreader(&s_default);
 
+    // memset: any handler left unset must be NULL — rcheevos probes the
+    // struct members (open_track_iterator first) and calls any non-NULL one.
     struct rc_hash_cdreader unified;
-    unified.open_track         = ra_unified_open_track;
-    unified.read_sector        = ra_unified_read_sector;
-    unified.close_track        = ra_unified_close_track;
-    unified.first_track_sector = ra_unified_first_track_sector;
+    memset(&unified, 0, sizeof(unified));
+    unified.open_track_iterator = ra_unified_open_track_iterator;
+    unified.read_sector         = ra_unified_read_sector;
+    unified.close_track         = ra_unified_close_track;
+    unified.first_track_sector  = ra_unified_first_track_sector;
     rc_hash_init_custom_cdreader(&unified);
 }
 
