@@ -1879,6 +1879,14 @@ static int read_edid(bool force = false)
 	uint8_t buf[sizeof(edid)] = {};
 	bool ddc_responded = false;
 
+	// Some sinks (e.g. HDMI capture cards) assert HPD/Monitor Sense before their
+	// DDC/EDID responder is actually ready, so the very first query can time out
+	// with no reply at all. Give those a few retries before concluding the sink
+	// has no EDID capability (DVI/VGA DACs etc.), so genuinely EDID-less sinks
+	// still don't pay the full 20-attempt budget on every boot.
+	const int no_response_retry_limit = 4;
+	int no_response_cnt = 0;
+
 	// waiting for valid EDID
 	for (int k = 0; k < 20; k++)
 	{
@@ -1889,9 +1897,13 @@ static int read_edid(bool force = false)
 			return 0;
 		}
 		bool got_interrupt = read_edid_segment(0, buf);
-		if (got_interrupt) ddc_responded = true;
+		if (got_interrupt)
+		{
+			ddc_responded = true;
+			no_response_cnt = 0;
+		}
 		if (is_edid_valid_buf(buf)) break;
-		if (!got_interrupt) break;  // no DDC response — display has no EDID, don't retry
+		if (!got_interrupt && ++no_response_cnt >= no_response_retry_limit) break;
 		usleep(100000);
 	}
 
@@ -2696,10 +2708,15 @@ void video_init()
 	// (Monitor Sense rose late on cold boot). Sinks that are up now but
 	// have no readable EDID (DVI, VGA DACs) would otherwise pay the
 	// blocking EDID retry loop a second time on every boot.
+	// Only adopt when the EDID we just read is actually valid: if it's
+	// still invalid, leave hpd_level at -1 so video_poll's first-sample
+	// recovery gets its one shot at a delayed re-read. That's what
+	// rescues sinks whose DDC responder (e.g. some HDMI capture cards)
+	// wasn't ready yet during this blocking read.
 	if (hdmi_main_fd >= 0)
 	{
 		int st42 = i2c_smbus_read_byte_data(hdmi_main_fd, 0x42);
-		if (st42 >= 0 && (st42 & 0x60) == 0x60)
+		if (st42 >= 0 && (st42 & 0x60) == 0x60 && is_edid_valid())
 		{
 			hpd_level = 1;
 			ms_level = 1;
