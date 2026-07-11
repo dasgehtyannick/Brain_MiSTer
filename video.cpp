@@ -1420,6 +1420,14 @@ int hdmi_has_int()
 #define INT_STUCK_WINDOW_MS  3000
 #define INT_STUCK_MIN_CNT    20
 #define INT_STUCK_POLL_MS    100
+// Some sinks (e.g. HDMI capture cards) hold HPD/Monitor Sense high from the
+// start but their DDC/EDID responder isn't ready for many seconds - far
+// longer than the handful of reinit attempts the hotplug edge/settle path
+// above allows before it goes quiet. This is a separate, edge-independent
+// ticker that just keeps retrying read_edid() at a slow, cheap cadence for
+// as long as the link claims to be up but no EDID has ever been obtained,
+// so those sinks recover on their own instead of needing a manual restart.
+#define EDID_RETRY_MS        4000
 
 enum { HPD_IDLE = 0, HPD_SETTLE };
 static int           hpd_sm_state = HPD_IDLE;
@@ -1434,6 +1442,8 @@ static bool          int_pin_usable = true;
 static unsigned long int_stuck_tmr = 0, int_stuck_poll_tmr = 0;
 static int           int_stuck_cnt = 0;
 static bool          hdmi_tx_on = true;
+static unsigned long edid_retry_tmr = 0;
+static bool          edid_retry_armed = false;
 
 static void hdmi_config_init()
 {
@@ -2733,17 +2743,24 @@ void video_init()
 	video_set_mode(&v_def, 0);
 }
 
-void video_reinit()
+// edid_already_fresh: caller just read a new, valid EDID itself (e.g. the
+// background retry in video_poll) and already decided a reinit is
+// warranted - skip the redundant read_edid()/unchanged-check here so a
+// success doesn't pay for two blocking DDC reads back to back.
+void video_reinit(bool edid_already_fresh = false)
 {
-	int prev_ver = edid_version;
-	read_edid(true);
-
-	// re-read gave nothing new but a valid EDID is still held: the mode is unchanged,
-	// so don't bounce a working link (some clones can't re-lock mid-operation)
-	if (edid_version == prev_ver && is_edid_valid())
+	if (!edid_already_fresh)
 	{
-		printf("*** Video re-init skipped: EDID unchanged.\n");
-		return;
+		int prev_ver = edid_version;
+		read_edid(true);
+
+		// re-read gave nothing new but a valid EDID is still held: the mode is unchanged,
+		// so don't bounce a working link (some clones can't re-lock mid-operation)
+		if (edid_version == prev_ver && is_edid_valid())
+		{
+			printf("*** Video re-init skipped: EDID unchanged.\n");
+			return;
+		}
 	}
 
 	printf("*** Video re-initialization.\n");
@@ -2993,6 +3010,43 @@ void video_poll()
 		hpd_edge_pending = false;
 		hpd_sm_state = HPD_IDLE;
 		break;
+	}
+
+	// Edge-independent EDID recovery: the settle/reinit-burst machinery above
+	// is edge-triggered and intentionally goes quiet after a few attempts to
+	// avoid hammering the transmitter on a flaky link. A sink that holds a
+	// perfectly stable HPD/MS high while its DDC responder just needs more
+	// time to come online (some HDMI capture cards take many seconds) would
+	// otherwise only ever get the handful of attempts made right around
+	// boot/hotplug and then be stuck on "No Signal" until physically
+	// replugged. Keep retrying read_edid() on its own slow timer for as long
+	// as the link claims to be up but no EDID has ever been read; only touch
+	// the rest of the pipeline (video_reinit) once a read actually succeeds.
+	if (hpd && ms && !is_edid_valid())
+	{
+		if (!edid_retry_armed)
+		{
+			edid_retry_armed = true;
+			edid_retry_tmr = GetTimer(EDID_RETRY_MS);
+		}
+		else if (CheckTimer(edid_retry_tmr))
+		{
+			edid_retry_tmr = GetTimer(EDID_RETRY_MS);
+			int prev_ver = edid_version;
+			read_edid(true);
+			if (edid_version != prev_ver && is_edid_valid())
+			{
+				printf("[HDMI] EDID recovered on background retry; applying.\n");
+				video_reinit(true);
+				i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, 0xFF);
+				hpd_edge_pending = false;
+				hpd_sm_state = HPD_IDLE;
+			}
+		}
+	}
+	else
+	{
+		edid_retry_armed = false;
 	}
 }
 
