@@ -203,6 +203,7 @@ static int g_recollect_interval        = 600; // frames between address re-colle
 static int g_smart_cache               = -1; // -1 = default per console, 1 = smart cache: rtquery on cache miss, no periodic recollect
 static int g_n64_snapshot              = 0;  // 1 = snapshot RDRAM at VBlank for consistent reads
 static int g_multiline_desc            = 0;  // 1 = wrap long text to extra lines instead of truncating with "..."
+static int g_pending_reset_request     = 0;  // RC_CLIENT_EVENT_RESET received: reset the core on the next poll tick
 static int g_smart_cleanup             = 1;  // 1 = dynamic-only smart-cache prune (SNES/NES/MD): drops AddAddress targets ~1/min; statics never pruned
 static int g_justifier_test            = 0;  // 1 = MegaDrive only: cap rtquery busy-wait (~1ms + fail-fast) to A/B test lightgun input latency
 
@@ -1047,6 +1048,15 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 		ra_play_achievement_sound();
 		break;
 
+	case RC_CLIENT_EVENT_RESET:
+		// Raised when hardcore is enabled with a game loaded: the runtime
+		// stays DISABLED until rc_client_reset is called after the system
+		// resets. Defer to the next poll tick — resetting from inside the
+		// event handler would re-enter rc_client.
+		RA_LOG("EVENT_RESET: runtime requests a system reset (hardcore enabled)");
+		g_pending_reset_request = 1;
+		break;
+
 	case RC_CLIENT_EVENT_SUBSET_COMPLETED:
 		{
 			// Per rc_client integration guide: "Completed" in softcore,
@@ -1110,6 +1120,10 @@ static void ra_login_callback(int result, const char *error_message,
                 if (g_rom_md5[0] && !g_game_loaded && !g_game_load_pending) {
                         if (g_mirror_validated) {
                                 RA_LOG("Game MD5 available, loading game: %s", g_rom_md5);
+                                // Consume the deferred flag: leaving it set made the next
+                                // mirror re-validation (e.g. after an OSD reset) trigger a
+                                // spurious full game reload.
+                                g_game_load_deferred = 0;
                                 g_game_load_pending = 1;
                                 rc_client_begin_load_game(g_client, g_rom_md5,
                                         ra_load_game_callback, NULL);
@@ -1621,6 +1635,19 @@ void achievements_poll(void)
 	// Show queued OSD notifications (achievement popups, etc.)
 	ra_osd_poll();
 
+	// RC_CLIENT_EVENT_RESET: the runtime asked for a system reset (hardcore
+	// enabled with a game loaded) and stays disabled until rc_client_reset
+	// runs. Pulse the conventional reset bit (status[0] on every RA-supported
+	// console core) and go through the same path as an OSD reset.
+	if (g_pending_reset_request) {
+		g_pending_reset_request = 0;
+		RA_LOG("Applying runtime reset request: pulsing core reset");
+		ra_notify_urgent("HARDCORE enabled\n\nResetting game...", 2500);
+		user_io_status_set("[0]", 1);
+		user_io_status_set("[0]", 0);
+		achievements_notify_core_reset(); // calls rc_client_reset -> re-enables runtime
+	}
+
 	if (!g_ra_map) return;
 
 	// Check if mirror has become active
@@ -1669,9 +1696,19 @@ void achievements_poll(void)
 						&& !g_game_load_pending) {
 					g_game_load_deferred = 0;
 					RA_LOG("FPGA validated — loading deferred game by MD5: %s", g_rom_md5);
+					// A (re)load is in flight: gate handler polls off until the
+					// callback confirms, so rc_client_do_frame is not hammered
+					// against a client whose game is mid-load.
+					g_game_loaded = 0;
 					g_game_load_pending = 1;
 					rc_client_begin_load_game(g_client, g_rom_md5,
 						ra_load_game_callback, NULL);
+				}
+				else if (g_game_loaded) {
+					// Core was reset with the game still loaded (OSD reset):
+					// achievements keep tracking — tell the user so the absence
+					// of the load popups is not mistaken for RA being off.
+					ra_notify("RetroAchievements\ntracking resumed", 2000);
 				}
 #endif
 			}
@@ -1950,7 +1987,7 @@ int achievements_smart_cache_enabled(void)
 
 #ifdef HAS_RCHEEVOS
 	int cid = ra_get_console_id();
-	if (cid == RC_CONSOLE_PLAYSTATION || cid == RC_CONSOLE_NINTENDO || cid == RC_CONSOLE_MEGA_DRIVE || cid == RC_CONSOLE_SUPER_NINTENDO) {
+	if (cid == RC_CONSOLE_PLAYSTATION || cid == RC_CONSOLE_NINTENDO || cid == RC_CONSOLE_MEGA_DRIVE || cid == RC_CONSOLE_SUPER_NINTENDO || cid == RC_CONSOLE_GAMEBOY_ADVANCE) {
 		return 1;
 	}
 #endif
