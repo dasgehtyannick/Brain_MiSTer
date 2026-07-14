@@ -1444,6 +1444,23 @@ static int           int_stuck_cnt = 0;
 static bool          hdmi_tx_on = true;
 static unsigned long edid_retry_tmr = 0;
 static bool          edid_retry_armed = false;
+static int           edid_retry_fail_cnt = 0;
+// After this many consecutive silent retries, some sinks (certain HDMI
+// capture cards) need more than a re-ask: their receiver's DDC emulation
+// is wedged and only a real TMDS clock loss/reacquire - the same event a
+// physical unplug/replug would cause - nudges it back to life. A software
+// "keep asking the same way" retry alone never wakes it, so periodically
+// power-cycle the transmitter briefly instead of just re-querying.
+#define EDID_NUDGE_AFTER_FAILS 3
+static int           edid_retry_nudge_cnt = 0;
+// A bare TX power-cycle only touches the ADV7513's output-stage power-down
+// bit (reg 0x41); it does not rewrite the chip's other registers, including
+// the ones that drive its internal DDC/EDID engine (0xC4/0xC9 and friends).
+// If that engine itself is what's wedged - not just the sink - the nudge
+// above does nothing forever. After this many nudges without success,
+// escalate to a full ADV7513 register reinit (the same path a real hotplug
+// edge triggers), which does rewrite those registers.
+#define EDID_FULL_REINIT_AFTER_NUDGES 3
 
 static void hdmi_config_init()
 {
@@ -3036,17 +3053,53 @@ void video_poll()
 			read_edid(true);
 			if (edid_version != prev_ver && is_edid_valid())
 			{
+				edid_retry_fail_cnt = 0;
+				edid_retry_nudge_cnt = 0;
 				printf("[HDMI] EDID recovered on background retry; applying.\n");
 				video_reinit(true);
 				i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, 0xFF);
 				hpd_edge_pending = false;
 				hpd_sm_state = HPD_IDLE;
 			}
+			else if (++edid_retry_fail_cnt >= EDID_NUDGE_AFTER_FAILS)
+			{
+				edid_retry_fail_cnt = 0;
+				if (++edid_retry_nudge_cnt >= EDID_FULL_REINIT_AFTER_NUDGES)
+				{
+					edid_retry_nudge_cnt = 0;
+					printf("[HDMI] %d nudges without success; forcing full ADV7513 reinit.\n", EDID_FULL_REINIT_AFTER_NUDGES);
+					// The lighter nudge below only power-cycles the output stage;
+					// if the chip's internal DDC engine itself is wedged (not just
+					// the sink), only rewriting its full register set - the same
+					// as a real hotplug edge does - clears it.
+					video_reinit();
+					i2c_smbus_write_byte_data(hdmi_main_fd, 0x96, 0xFF);
+					hpd_edge_pending = false;
+					hpd_sm_state = HPD_IDLE;
+				}
+				else
+				{
+					printf("[HDMI] %d silent EDID retries; power-cycling TX to nudge sink.\n", EDID_NUDGE_AFTER_FAILS);
+					// Brief, direct power-down/up of the ADV7513 output stage: stops
+					// TMDS clock/data long enough for the sink's receiver to see a
+					// signal-loss event and (hopefully) reset its own DDC/EDID
+					// state, same as it would on a physical unplug/replug. Written
+					// directly rather than via video_hdmi_power() so hpd_level/
+					// ms_level/edid[] and the rest of the hotplug state machine are
+					// left untouched - this is a hardware nudge, not a real
+					// power-down the rest of the driver needs to track.
+					i2c_smbus_write_byte_data(hdmi_main_fd, 0x41, 0x50);
+					usleep(700000);
+					i2c_smbus_write_byte_data(hdmi_main_fd, 0x41, 0x10);
+				}
+			}
 		}
 	}
 	else
 	{
 		edid_retry_armed = false;
+		edid_retry_fail_cnt = 0;
+		edid_retry_nudge_cnt = 0;
 	}
 }
 
