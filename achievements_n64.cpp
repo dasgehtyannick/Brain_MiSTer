@@ -5,6 +5,7 @@
 #include "ra_ramread.h"
 #include "user_io.h"
 #include "shmem.h"
+#include "support/n64/n64.h"
 #include <string.h>
 #include <time.h>
 #include <stdio.h>
@@ -57,7 +58,7 @@ static void n64_init(void)
 	ra_log_write("N64: Using RA DDRAM base 0x38000000 (avoiding SS slot collision)\n");
 }
 
-static void n64_reset(void)
+static void n64ra_reset(void)
 {
 	memset(&g_n64_state, 0, sizeof(g_n64_state));
 	g_n64_snapshot_active = 0;
@@ -97,7 +98,7 @@ static uint32_t n64_read_memory(void *map, uint32_t address, uint8_t *buffer, ui
 	return num_bytes;
 }
 
-static int n64_poll(void *map, void *client, int game_loaded)
+static int n64ra_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
 	if (!client || !game_loaded || !g_n64_rdram_direct) return 0;
@@ -181,6 +182,20 @@ static int n64_poll(void *map, void *client, int game_loaded)
 static int n64_calculate_hash(const char *rom_path, char *md5_hex_out)
 {
 #ifdef HAS_RCHEEVOS
+	// n64_rom_tx already computed the RA-compatible MD5 while streaming the
+	// ROM to DDR (full file normalized to big-endian/z64 — the exact
+	// rc_hash_n64 algorithm). Reusing it avoids re-reading the ROM here:
+	// a second full read (several seconds for zipped ROMs, decompressed
+	// through miniz) stalls the main loop right after the save images were
+	// mounted, starving the core's save I/O — reported as save corruption
+	// in Ridge Racer 64 with a zipped ROM.
+	const char *md5 = n64_get_rom_md5();
+	if (md5 && md5[0]) {
+		snprintf(md5_hex_out, 33, "%s", md5);
+		ra_log_write("N64 hash (from rom loader): %s\n", md5_hex_out);
+		return 1;
+	}
+
 	char abs_path[1024];
 	if (rom_path[0] == '/') {
 		snprintf(abs_path, sizeof(abs_path), "%s", rom_path);
@@ -193,9 +208,16 @@ static int n64_calculate_hash(const char *rom_path, char *md5_hex_out)
 		ra_log_write("N64 hash: %s\n", md5_hex_out);
 		return 1;
 	}
-	ra_log_write("N64: rc_hash_generate_from_file failed for %s\n", abs_path);
-#endif
+	ra_log_write("N64: rc_hash failed for %s -- skipping identify\n", abs_path);
+	// Report "handled" with an empty hash: the generic whole-file MD5
+	// fallback is wrong for N64 (no byte-order normalization) and would
+	// re-read the ROM, reintroducing the save-I/O stall.
+	md5_hex_out[0] = '\0';
+	return 1;
+#else
+	(void)rom_path; (void)md5_hex_out;
 	return 0;
+#endif
 }
 
 static void n64_set_hardcore(int enabled)
@@ -239,9 +261,9 @@ static int n64_detect_protocol(void *map)
 
 const console_handler_t g_console_n64 = {
 	.init = n64_init,
-	.reset = n64_reset,
+	.reset = n64ra_reset,
 	.read_memory = n64_read_memory,
-	.poll = n64_poll,
+	.poll = n64ra_poll,
 	.calculate_hash = n64_calculate_hash,
 	.set_hardcore = n64_set_hardcore,
 	.detect_protocol = n64_detect_protocol,
