@@ -8045,13 +8045,21 @@ void Info(const char *message, int timeout, int width, int height, int frame)
 	}
 }
 
-void InfoAt(const char *message, int timeout, int y_pos, int frame)
+void InfoAt(const char *message, int timeout, int y_pos, int frame, bool center)
 {
 	if (menustate <= MENU_INFO)
 	{
 		int width = 0, height = 0;
 		OSD_PrintInfo(message, &width, &height, frame);
-		InfoEnable(20, y_pos, width, height);
+
+		int x_pos = 20;
+		if (center && current_video_info.width)
+		{
+			x_pos = (current_video_info.width - width * 8) / 2;
+			if (x_pos < 0) x_pos = 0;
+		}
+
+		InfoEnable(x_pos, y_pos, width, height);
 		OsdSetSize(16);
 
 		menu_timer = GetTimer(timeout);

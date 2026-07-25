@@ -398,7 +398,7 @@ static void ra_osd_poll(void)
 	if (!s_urgent_showing && s_urgent_head != s_urgent_tail) {
 		ra_notif *n = &s_urgent_queue[s_urgent_tail % NOTIF_QUEUE_CAP];
 		s_urgent_tail++;
-		Info(n->text, n->duration_ms + 500, 0, 0, 1);
+		InfoAt(n->text, n->duration_ms + 500, (cfg.direct_video && get_vga_fb()) ? 30 : 10, 1, true);
 		if (n->play_sound) ra_play_achievement_sound();
 		s_urgent_timer    = GetTimer(n->duration_ms);
 		s_urgent_showing  = 1;
@@ -413,7 +413,7 @@ static void ra_osd_poll(void)
 	if (s_instant_pending) {
 		s_instant_pending = 0;
 		if (!s_urgent_showing) {
-			Info(s_instant_text, s_instant_duration_ms + 500, 0, 0, 1);
+			InfoAt(s_instant_text, s_instant_duration_ms + 500, (cfg.direct_video && get_vga_fb()) ? 30 : 10, 1, true);
 			s_instant_timer   = GetTimer(s_instant_duration_ms);
 			s_instant_showing = 1;
 			RA_LOG("OSD: Showing instant notification (%dms)", s_instant_duration_ms);
@@ -845,6 +845,13 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 					gba_dump_trigger(event->achievement->id);
 				char title_buf[96];
 				ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
+				// Points suffix (e.g. " [+10]") is appended after formatting the
+				// description, so the trunc/wrap width is shrunk by its length up
+				// front to keep it from being cut off at the OSD's 32-char line limit.
+				char points_suffix[16];
+				snprintf(points_suffix, sizeof(points_suffix), " [+%u]", event->achievement->points);
+				int desc_width = 28 - (int)strlen(points_suffix);
+				if (desc_width < 10) desc_width = 10;
 				// In multiline mode, prefix desc with "\-> " so it reads as a
 				// sub-line of the title. The prefix is added BEFORE wrapping so
 				// its 4 chars count toward the first line's width (adding it
@@ -854,13 +861,14 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 					char desc_prefixed[224];
 					snprintf(desc_prefixed, sizeof(desc_prefixed), "\\-> %s",
 						event->achievement->description);
-					ra_format_text(desc_prefixed, desc_display, sizeof(desc_display), 28, 28, 3);
+					ra_format_text(desc_prefixed, desc_display, sizeof(desc_display), desc_width, desc_width, 3);
 				} else {
-					ra_format_text(event->achievement->description, desc_display, sizeof(desc_display), 28, 28, 3);
+					ra_format_text(event->achievement->description, desc_display, sizeof(desc_display), desc_width, desc_width, 3);
 				}
+				strncat(desc_display, points_suffix, sizeof(desc_display) - strlen(desc_display) - 1);
 				char buf[NOTIF_TEXT_MAX];
 				snprintf(buf, sizeof(buf),
-					">> ACHIEVEMENT <<\n\n%s\n%s",
+					"%s\n%s",
 					title_buf, desc_display);
 								ra_notify_urgent(buf, 4000, 1);
 			}
