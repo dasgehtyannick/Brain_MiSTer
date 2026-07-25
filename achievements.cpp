@@ -196,7 +196,7 @@ static int g_show_leaderboards_updates = 1; // 1 = show STARTED/FAILED/TRACKER S
 static int g_show_leaderboards_submission = 1; // 1 = show SUBMITTED/SCOREBOARD popups
 static int g_hardcore                  = 0; // 1 = hardcore mode (disables cheats & save states)
 static int g_force_hardcore            = 0; // 1 = force hardcore mode even if core doesn't support it
-static int g_stall_recovery            = 0; // 1 = enable OptionC stall recovery (disabled by default)
+static int g_stall_recovery            = 0; // 1 = enable SelAddr stall recovery (disabled by default)
 static int g_rtquery_enabled           = 1; // 1 = enable realtime queries for AddAddress resolution
 static int g_gba_reset_ram             = 1; // 1 = clear IWRAM+EWRAM on game load (retroachievements.cfg: gba_reset_ram)
 static int g_recollect_interval        = 600; // frames between address re-collections (PSX default 600, SNES 18000)
@@ -732,7 +732,7 @@ static uint32_t ra_read_memory(uint32_t address, uint8_t *buffer,
 	int console = ra_get_console_id();
 	if (console == 7)  // NES
 		return ra_ramread_nes_read(g_ra_map, address, buffer, num_bytes);
-	if (console == 3)  // SNES VBlank-gated (handler returned 0 = not optionc)
+	if (console == 3)  // SNES VBlank-gated (handler returned 0 = not seladdr)
 		return ra_ramread_snes_read(g_ra_map, address, buffer, num_bytes);
 
 	memset(buffer, 0, num_bytes);
@@ -1360,7 +1360,7 @@ void achievements_init(void)
 	signal(SIGFPE,  ra_crash_handler);
 
 	RA_LOG("=== RetroAchievements for MiSTer ===");
-	RA_LOG("Build: OptionC v29-b1 (2026-04-19)");
+	RA_LOG("Build: SelAddr v29-b1 (2026-04-19)");
 	RA_LOG("Phase 5 — Handler dispatch: all per-console logic in separate files");
 
 	const char *core = user_io_get_core_name(1);
@@ -1608,6 +1608,43 @@ void achievements_load_game(const char *rom_path, uint32_t crc32)
         }
 }
 
+// ---------------------------------------------------------------------------
+// Save I/O guard
+//
+// While the core streams its save RAM to/from the ARM (autosave triggered by
+// opening the OSD, manual save/load backup), cores that share the save port
+// with the RA read path serve the SD transfer address instead of the requested
+// one — the SNES routes both through BSRAM Port B (bk_state mux), so every
+// BSRAM/BWRAM read returns a byte from wherever the transfer pointer is.
+// Evaluating rcheevos against those values fires delta conditions spuriously
+// (confirmed: SMRPG unlocks on OSD-open with autosave enabled).
+//
+// The guard suspends achievement evaluation from the first notification until
+// RA_SAVE_IO_GRACE_MS after the last one. The game keeps running; memrefs keep
+// their pre-save values, so deltas resume cleanly against real data. The OSD
+// open itself also arms the guard (see OsdEnable) to close the sub-millisecond
+// race between bk_state rising and the first serviced sector.
+// ---------------------------------------------------------------------------
+#define RA_SAVE_IO_GRACE_MS 700
+
+static struct timespec g_save_io_last = {0, 0};
+static int g_save_io_paused = 0; // evaluation currently suspended (for logs)
+
+void achievements_notify_save_io(void)
+{
+	clock_gettime(CLOCK_MONOTONIC, &g_save_io_last);
+}
+
+static int ra_save_io_active(void)
+{
+	if (!g_save_io_last.tv_sec) return 0;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	double ms = (now.tv_sec - g_save_io_last.tv_sec) * 1000.0
+	          + (now.tv_nsec - g_save_io_last.tv_nsec) / 1e6;
+	return ms < RA_SAVE_IO_GRACE_MS;
+}
+
 void achievements_poll(void)
 {
 	static uint32_t poll_calls = 0;
@@ -1744,8 +1781,24 @@ void achievements_poll(void)
 
 	(void)busy;
 
+	// Save I/O guard: suspend evaluation while save RAM streams between the
+	// core and the ARM (see achievements_notify_save_io). Everything above
+	// (HTTP pump, OSD popups, mirror validation) keeps running.
+	if (ra_save_io_active()) {
+		if (!g_save_io_paused && g_game_loaded) {
+			g_save_io_paused = 1;
+			RA_LOG("Save I/O detected — achievement evaluation paused");
+		}
+		return;
+	}
+	if (g_save_io_paused) {
+		g_save_io_paused = 0;
+		if (g_game_loaded)
+			RA_LOG("Save I/O finished — achievement evaluation resumed");
+	}
+
 #ifdef HAS_RCHEEVOS
-	// Dispatch to active console handler (handles all Option C consoles)
+	// Dispatch to active console handler (handles all Selective Address consoles)
 	if (g_active_handler && g_active_handler->poll) {
 		if (g_active_handler->poll(g_ra_map, g_client, g_game_loaded))
 			return;
@@ -1987,7 +2040,14 @@ int achievements_smart_cache_enabled(void)
 
 #ifdef HAS_RCHEEVOS
 	int cid = ra_get_console_id();
-	if (cid == RC_CONSOLE_PLAYSTATION || cid == RC_CONSOLE_NINTENDO || cid == RC_CONSOLE_MEGA_DRIVE || cid == RC_CONSOLE_SUPER_NINTENDO || cid == RC_CONSOLE_GAMEBOY_ADVANCE) {
+	// All Selective Address cores except SMS now support the RTQuery mailbox
+	// (SMS is Legacy-only: no FPGA-side realtime-query support yet).
+	if (cid == RC_CONSOLE_PLAYSTATION || cid == RC_CONSOLE_NINTENDO || cid == RC_CONSOLE_MEGA_DRIVE ||
+	    cid == RC_CONSOLE_SUPER_NINTENDO || cid == RC_CONSOLE_GAMEBOY_ADVANCE ||
+	    cid == RC_CONSOLE_GAMEBOY || cid == RC_CONSOLE_GAMEBOY_COLOR ||
+	    cid == RC_CONSOLE_SEGA_CD || cid == RC_CONSOLE_SEGA_32X ||
+	    cid == RC_CONSOLE_PC_ENGINE || cid == RC_CONSOLE_PC_ENGINE_CD ||
+	    cid == RC_CONSOLE_ARCADE || cid == RC_CONSOLE_NEO_GEO_CD) {
 		return 1;
 	}
 #endif

@@ -22,6 +22,11 @@ static console_state_t g_neogeo_state = {};
 static int g_neogeo_is_cd = 0;
 static int g_neogeo_rtquery = 0;
 
+// 1 while trigger state is primed from an all-zero bootstrap frame; the next
+// cache activation must rc_client_reset to discard it. Resolve-pass
+// re-activations run with REAL values, where a reset would only lose progress.
+static int g_neogeo_boot_zero = 0;
+
 // ---------------------------------------------------------------------------
 // NeoGeo Implementation
 // ---------------------------------------------------------------------------
@@ -31,6 +36,7 @@ static void neogeo_init(void)
 	memset(&g_neogeo_state, 0, sizeof(g_neogeo_state));
 	g_neogeo_is_cd = 0;
 	g_neogeo_rtquery = 0;
+	g_neogeo_boot_zero = 0;
 }
 
 static void neogeo_reset(void)
@@ -38,12 +44,13 @@ static void neogeo_reset(void)
 	memset(&g_neogeo_state, 0, sizeof(g_neogeo_state));
 	g_neogeo_is_cd = 0;
 	g_neogeo_rtquery = 0;
+	g_neogeo_boot_zero = 0;
 }
 
 
 static uint32_t neogeo_read_memory(void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes)
 {
-	if (g_neogeo_state.optionc) {
+	if (g_neogeo_state.seladdr) {
 		if (g_neogeo_state.collecting) {
 			for (uint32_t i = 0; i < num_bytes; i++) {
 				uint32_t a = (address + i);
@@ -53,15 +60,8 @@ static uint32_t neogeo_read_memory(void *map, uint32_t address, uint8_t *buffer,
 		}
 		if (g_neogeo_state.cache_ready) {
 			if (achievements_smart_cache_enabled() && g_neogeo_rtquery) {
-				if (g_neogeo_state.cache_reindexing) {
-					for (uint32_t i = 0; i < num_bytes; i++) {
-						uint32_t a = (address + i);
-						if (!g_neogeo_is_cd) a ^= 1;
-						uint32_t val = ra_rtquery_read(map, a, 1);
-						buffer[i] = (uint8_t)val;
-					}
-					return num_bytes;
-				}
+				// List-change misalignment is handled inside ra_snes_addrlist_*
+				// (active-snapshot mapping) — no rtquery-all reindex needed.
 				int any_miss = 0;
 				for (uint32_t i = 0; i < num_bytes; i++) {
 					uint32_t a = (address + i);
@@ -114,7 +114,7 @@ static uint32_t neogeo_read_memory(void *map, uint32_t address, uint8_t *buffer,
 static int neogeo_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
-	if (!client || !game_loaded || !map || !g_neogeo_state.optionc) return 0;
+	if (!client || !game_loaded || !map || !g_neogeo_state.seladdr) return 0;
 
 	rc_client_t *rc_client = (rc_client_t *)client;
 
@@ -124,6 +124,10 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 	if (achievements_smart_cache_enabled() && g_neogeo_rtquery) {
 
 		if (ra_snes_addrlist_count() == 0 && !g_neogeo_state.cache_ready) {
+			// Re-prime to WAITING before the all-zero collection frame so a
+			// mid-game re-bootstrap (stall recovery) cannot fire on zeros.
+			rc_client_reset(rc_client);
+			g_neogeo_boot_zero = 1;
 			g_neogeo_state.collecting = 1;
 			ra_snes_addrlist_begin_collect();
 			rc_client_do_frame(rc_client);
@@ -143,6 +147,12 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 				g_neogeo_state.game_frames = 0;
 				g_neogeo_state.poll_logged = 0;
 				clock_gettime(CLOCK_MONOTONIC, &g_neogeo_state.cache_time);
+				// Only the activation right after a zero-read bootstrap needs
+				// the re-prime; resolve passes ran with real values.
+				if (g_neogeo_boot_zero) {
+					rc_client_reset(rc_client);
+					g_neogeo_boot_zero = 0;
+				}
 				if (g_neogeo_state.needs_recollect)
 					ra_log_write("NeoGeo SmartCache: Cache active (pre-resolve)\n");
 				else
@@ -166,12 +176,7 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 			}
 		} else {
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-			optionc_resync_if_backward(&g_neogeo_state, resp_frame, "NeoGeo");
-
-			if (g_neogeo_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
-				g_neogeo_state.cache_reindexing = 0;
-				ra_log_write("NeoGeo SmartCache: Reindex complete (%d addrs)\n", ra_snes_addrlist_count());
-			}
+			seladdr_resync_if_backward(&g_neogeo_state, resp_frame, "NeoGeo");
 
 			if (resp_frame > g_neogeo_state.last_resp_frame) {
 				g_neogeo_state.last_resp_frame = resp_frame;
@@ -182,9 +187,12 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 					ra_log_write("NeoGeo SmartCache: GameFrame %u (addrs=%d)\n",
 						g_neogeo_state.game_frames, ra_snes_addrlist_count());
 
+				// Cleanup recollect only when the FPGA confirmed the current
+				// list — keeps a single revision in flight for the active
+				// snapshot in ra_snes_addrlist_*.
 				int cleanup_frame = (g_neogeo_state.game_frames % 600 == 0)
 					&& (g_neogeo_state.game_frames > 0)
-					&& !g_neogeo_state.cache_reindexing;
+					&& ra_snes_addrlist_is_ready(map);
 				if (cleanup_frame) {
 					g_neogeo_state.collecting = 1;
 					ra_snes_addrlist_begin_collect();
@@ -198,7 +206,6 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 					if (ra_snes_addrlist_end_collect(map)) {
 						int new_count = ra_snes_addrlist_count();
 						ra_log_write("NeoGeo SmartCache: Cleanup %d -> %d\n", old_count, new_count);
-						g_neogeo_state.cache_reindexing = 1;
 					}
 				} else {
 					if (ra_snes_addrlist_has_pending())
@@ -229,7 +236,10 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 	// ===================================================================
 
 	if (ra_snes_addrlist_count() == 0 && !g_neogeo_state.cache_ready) {
-		// Phase 1: Bootstrap — collect addresses with zeros
+		// Phase 1: Bootstrap — collect addresses with zeros.
+		// Re-prime to WAITING first (see smart-cache bootstrap).
+		rc_client_reset(rc_client);
+		g_neogeo_boot_zero = 1;
 		g_neogeo_state.collecting = 1;
 		ra_snes_addrlist_begin_collect();
 		rc_client_do_frame(rc_client);
@@ -238,10 +248,10 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 		if (changed) {
 			g_neogeo_state.needs_recollect = 1;
 			g_neogeo_state.resolve_pass = 0;
-			ra_log_write("NeoGeo OptionC: Bootstrap collection done, %d addrs written to DDRAM\n",
+			ra_log_write("NeoGeo SelAddr: Bootstrap collection done, %d addrs written to DDRAM\n",
 				ra_snes_addrlist_count());
 		} else {
-			ra_log_write("NeoGeo OptionC: No addresses collected\n");
+			ra_log_write("NeoGeo SelAddr: No addresses collected\n");
 		}
 	} else if (!g_neogeo_state.cache_ready) {
 		// Phase 2/4: Wait for FPGA cache
@@ -251,10 +261,16 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 			g_neogeo_state.game_frames = 0;
 			g_neogeo_state.poll_logged = 0;
 			clock_gettime(CLOCK_MONOTONIC, &g_neogeo_state.cache_time);
+			// Only the activation right after a zero-read bootstrap needs the
+			// re-prime; resolve passes ran with real values.
+			if (g_neogeo_boot_zero) {
+				rc_client_reset(rc_client);
+				g_neogeo_boot_zero = 0;
+			}
 			if (g_neogeo_state.needs_recollect) {
-				ra_log_write("NeoGeo OptionC: Cache active (pre-recollect). Will resolve pointers.\n");
+				ra_log_write("NeoGeo SelAddr: Cache active (pre-recollect). Will resolve pointers.\n");
 			} else {
-				ra_log_write("NeoGeo OptionC: Cache active! FPGA response matched request.\n");
+				ra_log_write("NeoGeo SelAddr: Cache active! FPGA response matched request.\n");
 			}
 			const uint32_t *a0 = ra_snes_addrlist_addrs();
 			int ac = ra_snes_addrlist_count();
@@ -273,24 +289,24 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 		g_neogeo_state.collecting = 0;
 		int changed = ra_snes_addrlist_end_collect(map);
 		if (changed && g_neogeo_state.resolve_pass < 4) {
-			ra_log_write("NeoGeo OptionC: Pointer-resolve pass %d, %d addrs (changed, retrying)\n",
+			ra_log_write("NeoGeo SelAddr: Pointer-resolve pass %d, %d addrs (changed, retrying)\n",
 				g_neogeo_state.resolve_pass, ra_snes_addrlist_count());
 			g_neogeo_state.cache_ready = 0; // wait for new FPGA data
 		} else {
 			g_neogeo_state.needs_recollect = 0;
 			if (changed) {
-				ra_log_write("NeoGeo OptionC: Pointer-resolve done (max passes), %d addrs\n",
+				ra_log_write("NeoGeo SelAddr: Pointer-resolve done (max passes), %d addrs\n",
 					ra_snes_addrlist_count());
 				g_neogeo_state.cache_ready = 0;
 			} else {
-				ra_log_write("NeoGeo OptionC: Pointer-resolve complete, no address changes (%d addrs)\n",
+				ra_log_write("NeoGeo SelAddr: Pointer-resolve complete, no address changes (%d addrs)\n",
 					ra_snes_addrlist_count());
 			}
 		}
 	} else {
 		// Phase 5: Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-		optionc_resync_if_backward(&g_neogeo_state, resp_frame, "NeoGeo");
+		seladdr_resync_if_backward(&g_neogeo_state, resp_frame, "NeoGeo");
 		if (resp_frame > g_neogeo_state.last_resp_frame) {
 			g_neogeo_state.last_resp_frame = resp_frame;
 			g_neogeo_state.game_frames++;
@@ -298,26 +314,30 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 			clock_gettime(CLOCK_MONOTONIC, &g_neogeo_state.stall_time);
 			g_neogeo_state.stall_frame = resp_frame;
 
-			// Re-collect every 18000 frames (~5min).
-			// Smart cache mode: skip re-collect
-			int re_collect = !achievements_smart_cache_enabled()
-				&& (g_neogeo_state.game_frames % 18000 == 0) && (g_neogeo_state.game_frames > 0);
-			if (re_collect) {
-				g_neogeo_state.collecting = 1;
-				ra_snes_addrlist_begin_collect();
-			}
+			// Skip achievement processing while a recollect revision is in
+			// flight (newly collected addresses would read as 0).
+			if (ra_snes_addrlist_is_ready(map)) {
+				// Re-collect every 18000 frames (~5min).
+				// Smart cache mode: skip re-collect
+				int re_collect = !achievements_smart_cache_enabled()
+					&& (g_neogeo_state.game_frames % 18000 == 0) && (g_neogeo_state.game_frames > 0);
+				if (re_collect) {
+					g_neogeo_state.collecting = 1;
+					ra_snes_addrlist_begin_collect();
+				}
 
-			rc_client_do_frame(rc_client);
+				rc_client_do_frame(rc_client);
 
-			if (re_collect) {
-				g_neogeo_state.collecting = 0;
-				if (ra_snes_addrlist_end_collect(map)) {
-					ra_log_write("NeoGeo OptionC: Address list refreshed, %d addrs\n",
-						ra_snes_addrlist_count());
+				if (re_collect) {
+					g_neogeo_state.collecting = 0;
+					if (ra_snes_addrlist_end_collect(map)) {
+						ra_log_write("NeoGeo SelAddr: Address list refreshed, %d addrs\n",
+							ra_snes_addrlist_count());
+					}
 				}
 			}
 		} else {
-			optionc_check_stall_recovery(&g_neogeo_state, resp_frame, "NeoGeo");
+			seladdr_check_stall_recovery(&g_neogeo_state, resp_frame, "NeoGeo");
 		}
 	}
 
@@ -417,9 +437,9 @@ static int neogeo_detect_protocol(void *map)
 		ra_log_write("NeoGeo: FPGA mirror not detected -- RA support unavailable\n");
 		return 0;
 	}
-	g_neogeo_state.optionc = 1;
+	g_neogeo_state.seladdr = 1;
 	g_neogeo_is_cd = is_neogeo_cd();
-	ra_log_write("%s FPGA protocol: Option C (selective address reading)\n",
+	ra_log_write("%s FPGA protocol: Selective Address (selective address reading)\n",
 		g_neogeo_is_cd ? "NeoGeoCD" : "NeoGeo");
 
 	if (ra_rtquery_supported(map) && achievements_rtquery_enabled()) {

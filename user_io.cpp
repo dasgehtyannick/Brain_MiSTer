@@ -3307,7 +3307,14 @@ void user_io_poll()
 			{
 				//printf("SD WR %llu on %d\n", lba, disk);
 
-				if (use_save) menu_process_save();
+				if (use_save)
+				{
+					menu_process_save();
+					// Suspend RA evaluation: on cores that share the save
+					// port with the RA read path this transfer corrupts
+					// RA-visible save-RAM reads (see achievements_notify_save_io).
+					achievements_notify_save_io();
+				}
 
 				buffer_lba[disk] = -1;
 
@@ -3355,6 +3362,12 @@ void user_io_poll()
 			}
 			else if (op & 1)
 			{
+				// Save-slot reads (load backup / restore): same port-sharing
+				// corruption as writes. Strict disk check so CD-image reads on
+				// other slots never arm the guard.
+				if (use_save && (disk == 0 || (is_saturn() && disk == 1)))
+					achievements_notify_save_io();
+
 				uint32_t buf_n = sizeof(buffer[0]) / blksz;
 				if (is_psx() && blksz == 2352)
 				{

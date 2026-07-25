@@ -23,10 +23,10 @@ static console_state_t g_snes_state = {0};
 static int g_snes_rtquery = 0; // 1 if FPGA supports realtime queries
 
 // ---------------------------------------------------------------------------
-// SNES Option C Diagnostics
+// SNES Selective Address Diagnostics
 // ---------------------------------------------------------------------------
 
-static void snes_optionc_dump_valcache(const char *label, void *map)
+static void snes_seladdr_dump_valcache(const char *label, void *map)
 {
 	if (!map) return;
 	const uint8_t *base = (const uint8_t *)map;
@@ -88,28 +88,18 @@ static void snes_reset(void)
 
 static uint32_t snes_read_memory(void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes)
 {
-	if (g_snes_state.optionc) {
+	if (g_snes_state.seladdr) {
 		if (g_snes_state.collecting) {
 			for (uint32_t i = 0; i < num_bytes; i++)
 				ra_snes_addrlist_add(address + i);
 		}
 		if (g_snes_state.cache_ready) {
 			if (achievements_smart_cache_enabled() && g_snes_rtquery) {
-				// During reindexing, use rtquery for all reads
-				if (g_snes_state.cache_reindexing) {
-					if (num_bytes <= 4) {
-						uint32_t val = ra_rtquery_read(map, address, num_bytes);
-						for (uint32_t i = 0; i < num_bytes; i++)
-							buffer[i] = (uint8_t)(val >> (i * 8));
-						return num_bytes;
-					}
-					for (uint32_t i = 0; i < num_bytes; i++) {
-						uint32_t val = ra_rtquery_read(map, address + i, 1);
-						buffer[i] = (uint8_t)val;
-					}
-					return num_bytes;
-				}
-				// Smart Cache: check each byte, rtquery on miss
+				// Smart Cache: check each byte, rtquery on miss.
+				// Misalignment after list changes is handled inside
+				// ra_snes_addrlist_* (active-snapshot mapping): cached
+				// lookups always follow the ordering the FPGA confirmed,
+				// so no rtquery-all reindex window is needed.
 				int any_miss = 0;
 				for (uint32_t i = 0; i < num_bytes; i++) {
 					if (ra_snes_addrlist_contains(address + i) < 0) {
@@ -165,7 +155,7 @@ static uint32_t snes_read_memory(void *map, uint32_t address, uint8_t *buffer, u
 static int snes_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
-	if (!client || !game_loaded || !map || !g_snes_state.optionc)
+	if (!client || !game_loaded || !map || !g_snes_state.seladdr)
 		return 0;
 
 	rc_client_t *rc_client = (rc_client_t *)client;
@@ -177,6 +167,11 @@ static int snes_poll(void *map, void *client, int game_loaded)
 
 		if (ra_snes_addrlist_count() == 0 && !g_snes_state.cache_ready) {
 			// Phase 1: Bootstrap
+			// Re-prime triggers to WAITING before the collection frame: it
+			// runs with all reads returning zero, and after a mid-game
+			// re-bootstrap (stall recovery) active triggers could fire on
+			// those zeros. WAITING absorbs conditions that are true here.
+			rc_client_reset(rc_client);
 			g_snes_state.collecting = 1;
 			ra_snes_addrlist_begin_collect();
 			rc_client_do_frame(rc_client);
@@ -196,20 +191,19 @@ static int snes_poll(void *map, void *client, int game_loaded)
 				g_snes_state.game_frames = 0;
 				g_snes_state.poll_logged = 0;
 				clock_gettime(CLOCK_MONOTONIC, &g_snes_state.cache_time);
-				ra_log_write("SNES SmartCache: Cache active! %d addrs monitored\n",
+				// Re-prime all triggers against real memory: the bootstrap
+				// frame ran with zeros, which disarms rcheevos' initial
+				// waiting-state protection and poisons delta conditions
+				// (0 -> real transitions would fire "increased" chains).
+				rc_client_reset(rc_client);
+				ra_log_write("SNES SmartCache: Cache active! %d addrs monitored (rc_client reset)\n",
 					ra_snes_addrlist_count());
-				snes_optionc_dump_valcache("smart-active", map);
+				snes_seladdr_dump_valcache("smart-active", map);
 			}
 		} else {
 			// Phase 3: Normal — cache miss handled in read_memory
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-			optionc_resync_if_backward(&g_snes_state, resp_frame, "SNES");
-
-			if (g_snes_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
-				g_snes_state.cache_reindexing = 0;
-				ra_log_write("SNES SmartCache: Reindex complete (%d addrs)\n",
-					ra_snes_addrlist_count());
-			}
+			seladdr_resync_if_backward(&g_snes_state, resp_frame, "SNES");
 
 			if (resp_frame > g_snes_state.last_resp_frame) {
 				g_snes_state.last_resp_frame = resp_frame;
@@ -228,13 +222,11 @@ static int snes_poll(void *map, void *client, int game_loaded)
 				// re-add themselves via rtquery misses next frame.
 				if (achievements_smart_cleanup_enabled()
 						&& (g_snes_state.game_frames % 3600 == 0)
-						&& !g_snes_state.cache_reindexing
 						&& ra_snes_addrlist_dyn_count() > 128) {
 					int removed = ra_snes_addrlist_prune_dynamic(map);
 					if (removed) {
 						ra_log_write("SNES SmartCache: pruned %d dynamic addrs (%d static kept)\n",
 							removed, ra_snes_addrlist_count());
-						g_snes_state.cache_reindexing = 1;
 					}
 				} else if (ra_snes_addrlist_has_pending()) {
 					ra_snes_addrlist_flush_dynamic(map);
@@ -252,11 +244,11 @@ static int snes_poll(void *map, void *client, int game_loaded)
 				+ (now.tv_nsec - g_snes_state.cache_time.tv_nsec) / 1e9;
 			double ms_per_cycle = (g_snes_state.game_frames > 0) ?
 				(elapsed * 1000.0 / g_snes_state.game_frames) : 0.0;
-			ra_log_write("POLL(SNES-SC): resp_frame=%u game_frames=%u elapsed=%.1fs ms/cycle=%.1f addrs=%d reindexing=%d\n",
+			ra_log_write("POLL(SNES-SC): resp_frame=%u game_frames=%u elapsed=%.1fs ms/cycle=%.1f addrs=%d dyn=%d\n",
 				g_snes_state.last_resp_frame, g_snes_state.game_frames, elapsed, ms_per_cycle,
-				ra_snes_addrlist_count(), g_snes_state.cache_reindexing);
+				ra_snes_addrlist_count(), ra_snes_addrlist_dyn_count());
 			if ((g_snes_state.game_frames % 1800) < 300)
-				snes_optionc_dump_valcache("periodic-sc", map);
+				snes_seladdr_dump_valcache("periodic-sc", map);
 		}
 
 		return 1;
@@ -267,18 +259,21 @@ static int snes_poll(void *map, void *client, int game_loaded)
 	// ===================================================================
 
 	if (ra_snes_addrlist_count() == 0 && !g_snes_state.cache_ready) {
-		// Bootstrap: run one do_frame with zeros to discover needed addresses
+		// Bootstrap: run one do_frame with zeros to discover needed addresses.
+		// Re-prime to WAITING first so active triggers (mid-game re-bootstrap
+		// after stall recovery) cannot fire on the all-zero reads.
+		rc_client_reset(rc_client);
 		g_snes_state.collecting = 1;
 		ra_snes_addrlist_begin_collect();
 		rc_client_do_frame(rc_client);
 		g_snes_state.collecting = 0;
 		int changed = ra_snes_addrlist_end_collect(map);
 		if (changed) {
-			ra_log_write("SNES OptionC: Bootstrap collection done, %d addrs written to DDRAM\n",
+			ra_log_write("SNES SelAddr: Bootstrap collection done, %d addrs written to DDRAM\n",
 				ra_snes_addrlist_count());
-			snes_optionc_dump_valcache("bootstrap", map);
+			snes_seladdr_dump_valcache("bootstrap", map);
 		} else {
-			ra_log_write("SNES OptionC: No addresses collected — achievements may have no memory refs\n");
+			ra_log_write("SNES SelAddr: No addresses collected — achievements may have no memory refs\n");
 		}
 	} else if (!g_snes_state.cache_ready) {
 		// Wait for FPGA to respond with cached values
@@ -288,13 +283,15 @@ static int snes_poll(void *map, void *client, int game_loaded)
 			g_snes_state.game_frames = 0;
 			g_snes_state.poll_logged = 0;
 			clock_gettime(CLOCK_MONOTONIC, &g_snes_state.cache_time);
-			ra_log_write("SNES OptionC: Cache active! FPGA response matched request.\n");
-			snes_optionc_dump_valcache("cache-active", map);
+			// Discard the zero-primed bootstrap state (see smart-cache path).
+			rc_client_reset(rc_client);
+			ra_log_write("SNES SelAddr: Cache active! FPGA response matched request (rc_client reset).\n");
+			snes_seladdr_dump_valcache("cache-active", map);
 		}
 	} else {
 		// Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-		optionc_resync_if_backward(&g_snes_state, resp_frame, "SNES");
+		seladdr_resync_if_backward(&g_snes_state, resp_frame, "SNES");
 		if (resp_frame > g_snes_state.last_resp_frame) {
 			g_snes_state.last_resp_frame = resp_frame;
 			g_snes_state.game_frames++;
@@ -304,31 +301,37 @@ static int snes_poll(void *map, void *client, int game_loaded)
 
 			// Dump first 5 frames after cache became active
 			if (g_snes_state.game_frames <= 5) {
-				ra_log_write("SNES OptionC: GameFrame %u (resp_frame=%u)\n",
+				ra_log_write("SNES SelAddr: GameFrame %u (resp_frame=%u)\n",
 					g_snes_state.game_frames, resp_frame);
-				snes_optionc_dump_valcache("early-frame", map);
+				snes_seladdr_dump_valcache("early-frame", map);
 			}
 
-			// Periodically re-collect to catch address changes (every ~5 min)
-			// Smart cache mode: skip re-collect (no dynamic pointers in SNES)
-			int re_collect = !achievements_smart_cache_enabled()
-				&& (g_snes_state.game_frames % 18000 == 0) && (g_snes_state.game_frames > 0);
-			if (re_collect) {
-				g_snes_state.collecting = 1;
-				ra_snes_addrlist_begin_collect();
-			}
+			// While a recollect revision is in flight (FPGA not yet confirmed)
+			// newly collected addresses would read as 0 — skip achievement
+			// processing for those 1-2 frames. Confirmed-snapshot addresses
+			// stay valid throughout.
+			if (ra_snes_addrlist_is_ready(map)) {
+				// Periodically re-collect to catch address changes (every ~5 min)
+				// Smart cache mode: skip re-collect (no dynamic pointers in SNES)
+				int re_collect = !achievements_smart_cache_enabled()
+					&& (g_snes_state.game_frames % 18000 == 0) && (g_snes_state.game_frames > 0);
+				if (re_collect) {
+					g_snes_state.collecting = 1;
+					ra_snes_addrlist_begin_collect();
+				}
 
-			rc_client_do_frame(rc_client);
+				rc_client_do_frame(rc_client);
 
-			if (re_collect) {
-				g_snes_state.collecting = 0;
-				if (ra_snes_addrlist_end_collect(map)) {
-					ra_log_write("SNES OptionC: Address list refreshed, %d addrs\n",
-						ra_snes_addrlist_count());
+				if (re_collect) {
+					g_snes_state.collecting = 0;
+					if (ra_snes_addrlist_end_collect(map)) {
+						ra_log_write("SNES SelAddr: Address list refreshed, %d addrs\n",
+							ra_snes_addrlist_count());
+					}
 				}
 			}
 		} else {
-			optionc_check_stall_recovery(&g_snes_state, resp_frame, "SNES");
+			seladdr_check_stall_recovery(&g_snes_state, resp_frame, "SNES");
 		}
 	}
 
@@ -346,10 +349,10 @@ static int snes_poll(void *map, void *client, int game_loaded)
 			g_snes_state.last_resp_frame, g_snes_state.game_frames, elapsed, ms_per_cycle,
 			ra_snes_addrlist_count());
 		if ((g_snes_state.game_frames % 1800) < 300)
-			snes_optionc_dump_valcache("periodic", map);
+			snes_seladdr_dump_valcache("periodic", map);
 	}
 
-	return 1; // SNES Option C handled
+	return 1; // SNES Selective Address handled
 #else
 	return 0;
 #endif
@@ -415,15 +418,15 @@ int snes_detect_protocol(void *map)
 	}
 	const ra_header_t *hdr = (const ra_header_t *)map;
 	if (hdr->region_count == 0) {
-		g_snes_state.optionc = 1;
-		ra_log_write("SNES FPGA protocol: Option C (selective address reading)\n");
+		g_snes_state.seladdr = 1;
+		ra_log_write("SNES FPGA protocol: Selective Address (selective address reading)\n");
 	} else {
-		g_snes_state.optionc = 0;
+		g_snes_state.seladdr = 0;
 		ra_log_write("SNES FPGA protocol: VBlank-gated full mirror (region_count=%d)\n",
 			hdr->region_count);
 	}
 
-	if (g_snes_state.optionc) {
+	if (g_snes_state.seladdr) {
 		if (ra_rtquery_supported(map) && achievements_rtquery_enabled()) {
 			g_snes_rtquery = 1;
 			ra_rtquery_init(map);

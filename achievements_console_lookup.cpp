@@ -104,13 +104,13 @@ void init_all_console_handlers(void)
 
 
 // ---------------------------------------------------------------------------
-// Shared OptionC stall recovery
+// Shared SelAddr stall recovery
 // ---------------------------------------------------------------------------
 
 #include "achievements.h"
 #include "ra_ramread.h"
 
-int optionc_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
+int seladdr_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
                                   const char *console_name)
 {
         if (!achievements_stall_recovery_enabled()) return 0;
@@ -121,7 +121,7 @@ int optionc_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
                 + (now.tv_nsec - state->stall_time.tv_nsec) / 1e9;
 
         if (stall_secs >= 5.0 && state->stall_frame == resp_frame) {
-                ra_log_write("%s OptionC: STALL RECOVERY -- resp_frame=%u stuck for %.1fs, re-collecting\n",
+                ra_log_write("%s SelAddr: STALL RECOVERY -- resp_frame=%u stuck for %.1fs, re-collecting\n",
                         console_name, resp_frame, stall_secs);
                 state->cache_ready = 0;
                 state->needs_recollect = 0;
@@ -133,11 +133,11 @@ int optionc_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
         return 0;
 }
 
-int optionc_resync_if_backward(console_state_t *state, uint32_t resp_frame,
+int seladdr_resync_if_backward(console_state_t *state, uint32_t resp_frame,
                                 const char *console_name)
 {
         if (resp_frame < state->last_resp_frame) {
-                ra_log_write("%s OptionC: resp_frame went backward (%u -> %u) -- FPGA reset without notify, resyncing\n",
+                ra_log_write("%s SelAddr: resp_frame went backward (%u -> %u) -- FPGA reset without notify, resyncing\n",
                         console_name, state->last_resp_frame, resp_frame);
                 state->last_resp_frame = resp_frame;
                 clock_gettime(CLOCK_MONOTONIC, &state->stall_time);

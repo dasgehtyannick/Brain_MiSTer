@@ -8,9 +8,9 @@
 #include "rc_client.h"
 #endif
 
-// Common console state structure for Option C consoles
+// Common console state structure for Selective Address consoles
 typedef struct {
-	int optionc;              // 1 if FPGA has Option C protocol
+	int seladdr;              // 1 if FPGA has Selective Address protocol
 	int collecting;           // 1 during address collection do_frame
 	int cache_ready;          // 1 when FPGA response matches request
 	int needs_recollect;      // 1 if re-collection needed (PSX/N64/NeoGeo)
@@ -21,7 +21,6 @@ typedef struct {
 	struct timespec cache_time; // Timestamp when cache became active
 	struct timespec stall_time; // Timestamp when resp_frame last advanced
 	uint32_t stall_frame;       // resp_frame value when stall tracking started
-	int cache_reindexing;       // 1 after cleanup prune, until FPGA responds with new index order
 } console_state_t;
 
 // Console-specific interface
@@ -89,21 +88,21 @@ const console_handler_t *get_console_handler_by_id(int console_id);
 // Initialize all console handlers (called once at startup)
 void init_all_console_handlers(void);
 
-// Shared OptionC stall recovery check.
+// Shared SelAddr stall recovery check.
 // Call from the else branch of 'if (resp_frame > state->last_resp_frame)'.
 // Returns 1 if recovery was triggered (caller should reset cache_ready etc).
 // Requires: achievements_stall_recovery_enabled() from achievements.h
-int optionc_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
+int seladdr_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
                                   const char *console_name);
 
-// Shared OptionC backward-frame resync.
+// Shared SelAddr backward-frame resync.
 // Call right after reading resp_frame, before comparing it to last_resp_frame.
 // If the FPGA frame counter went backward (core was reset without the ARM
 // being notified — e.g. savestate load, download reset, PAL/NTSC switch, or a
 // stale post-reset response), resyncs last_resp_frame so tracking resumes on
 // the next VBlank instead of stalling until the counter catches up.
 // Returns 1 if a resync happened.
-int optionc_resync_if_backward(console_state_t *state, uint32_t resp_frame,
+int seladdr_resync_if_backward(console_state_t *state, uint32_t resp_frame,
                                 const char *console_name);
 
 // GBA: dump valcache when an achievement triggers (call from event handler)
