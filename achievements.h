@@ -33,6 +33,14 @@ void achievements_unload_game(void);
 // Notify RA runtime that an in-core reset happened (without unloading the game).
 void achievements_notify_core_reset(void);
 
+// Notify that save-RAM I/O between the core and the ARM is happening (autosave
+// on OSD-open, manual save/load backup). Cores that share the save port with
+// the RA read path (e.g. SNES BSRAM Port B) return bytes from the SD transfer
+// pointer instead of the requested address while the transfer runs, so
+// achievement evaluation is suspended for the burst plus a grace period.
+// Call once per serviced sector (cheap: just stamps a timestamp).
+void achievements_notify_save_io(void);
+
 // Shutdown. Frees all resources.
 void achievements_deinit(void);
 

@@ -38,26 +38,15 @@ static void genesis_reset(void)
 
 static uint32_t genesis_read_memory(void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes)
 {
-	if (g_md_state.optionc) {
+	if (g_md_state.seladdr) {
 		if (g_md_state.collecting) {
 			for (uint32_t i = 0; i < num_bytes; i++)
 				ra_snes_addrlist_add(address + i);
 		}
 		if (g_md_state.cache_ready) {
 			if (achievements_smart_cache_enabled() && g_md_rtquery) {
-				if (g_md_state.cache_reindexing) {
-					if (num_bytes <= 4) {
-						uint32_t val = ra_rtquery_read(map, address, num_bytes);
-						for (uint32_t i = 0; i < num_bytes; i++)
-							buffer[i] = (uint8_t)(val >> (i * 8));
-						return num_bytes;
-					}
-					for (uint32_t i = 0; i < num_bytes; i++) {
-						uint32_t val = ra_rtquery_read(map, address + i, 1);
-						buffer[i] = (uint8_t)val;
-					}
-					return num_bytes;
-				}
+				// List-change misalignment is handled inside ra_snes_addrlist_*
+				// (active-snapshot mapping) — no rtquery-all reindex needed.
 				int any_miss = 0;
 				for (uint32_t i = 0; i < num_bytes; i++) {
 					if (ra_snes_addrlist_contains(address + i) < 0) {
@@ -107,7 +96,7 @@ static uint32_t genesis_read_memory(void *map, uint32_t address, uint8_t *buffer
 static int genesis_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
-	if (!client || !game_loaded || !map || !g_md_state.optionc) return 0;
+	if (!client || !game_loaded || !map || !g_md_state.seladdr) return 0;
 
 	rc_client_t *rc_client = (rc_client_t *)client;
 
@@ -117,6 +106,9 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 	if (achievements_smart_cache_enabled() && g_md_rtquery) {
 
 		if (ra_snes_addrlist_count() == 0 && !g_md_state.cache_ready) {
+			// Re-prime to WAITING before the all-zero collection frame so a
+			// mid-game re-bootstrap (stall recovery) cannot fire on zeros.
+			rc_client_reset(rc_client);
 			g_md_state.collecting = 1;
 			ra_snes_addrlist_begin_collect();
 			rc_client_do_frame(rc_client);
@@ -133,16 +125,14 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 				g_md_state.game_frames = 0;
 				g_md_state.poll_logged = 0;
 				clock_gettime(CLOCK_MONOTONIC, &g_md_state.cache_time);
-				ra_log_write("MD SmartCache: Cache active! %d addrs\n", ra_snes_addrlist_count());
+				// Discard the zero-primed bootstrap state (delta conditions
+				// would otherwise see 0 -> real transitions and fire).
+				rc_client_reset(rc_client);
+				ra_log_write("MD SmartCache: Cache active! %d addrs (rc_client reset)\n", ra_snes_addrlist_count());
 			}
 		} else {
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-			optionc_resync_if_backward(&g_md_state, resp_frame, "Genesis");
-
-			if (g_md_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
-				g_md_state.cache_reindexing = 0;
-				ra_log_write("MD SmartCache: Reindex complete (%d addrs)\n", ra_snes_addrlist_count());
-			}
+			seladdr_resync_if_backward(&g_md_state, resp_frame, "Genesis");
 
 			if (resp_frame > g_md_state.last_resp_frame) {
 				g_md_state.last_resp_frame = resp_frame;
@@ -160,13 +150,11 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 				// re-add themselves via rtquery misses next frame.
 				if (achievements_smart_cleanup_enabled()
 						&& (g_md_state.game_frames % 3600 == 0)
-						&& !g_md_state.cache_reindexing
 						&& ra_snes_addrlist_dyn_count() > 128) {
 					int removed = ra_snes_addrlist_prune_dynamic(map);
 					if (removed) {
 						ra_log_write("MD SmartCache: pruned %d dynamic addrs (%d static kept)\n",
 							removed, ra_snes_addrlist_count());
-						g_md_state.cache_reindexing = 1;
 					}
 				} else if (ra_snes_addrlist_has_pending()) {
 					ra_snes_addrlist_flush_dynamic(map);
@@ -195,17 +183,19 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 	// ===================================================================
 
 	if (ra_snes_addrlist_count() == 0 && !g_md_state.cache_ready) {
-		// Bootstrap: run one do_frame with zeros to discover needed addresses
+		// Bootstrap: run one do_frame with zeros to discover needed addresses.
+		// Re-prime to WAITING first (see smart-cache bootstrap).
+		rc_client_reset(rc_client);
 		g_md_state.collecting = 1;
 		ra_snes_addrlist_begin_collect();
 		rc_client_do_frame(rc_client);
 		g_md_state.collecting = 0;
 		int changed = ra_snes_addrlist_end_collect(map);
 		if (changed) {
-			ra_log_write("MD OptionC: Bootstrap collection done, %d addrs written to DDRAM\n",
+			ra_log_write("MD SelAddr: Bootstrap collection done, %d addrs written to DDRAM\n",
 				ra_snes_addrlist_count());
 		} else {
-			ra_log_write("MD OptionC: No addresses collected\n");
+			ra_log_write("MD SelAddr: No addresses collected\n");
 		}
 	} else if (!g_md_state.cache_ready) {
 		// Wait for FPGA to respond with cached values
@@ -215,7 +205,9 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 			g_md_state.game_frames = 0;
 			g_md_state.poll_logged = 0;
 			clock_gettime(CLOCK_MONOTONIC, &g_md_state.cache_time);
-			ra_log_write("MD OptionC: Cache active! FPGA response matched request.\n");
+			// Discard the zero-primed bootstrap state (see smart-cache path).
+			rc_client_reset(rc_client);
+			ra_log_write("MD SelAddr: Cache active! FPGA response matched request (rc_client reset).\n");
 			// Dump address list once on activation
 			const uint32_t *a0 = ra_snes_addrlist_addrs();
 			int ac = ra_snes_addrlist_count();
@@ -228,7 +220,7 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 	} else {
 		// Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-		optionc_resync_if_backward(&g_md_state, resp_frame, "Genesis");
+		seladdr_resync_if_backward(&g_md_state, resp_frame, "Genesis");
 		if (resp_frame > g_md_state.last_resp_frame) {
 			g_md_state.last_resp_frame = resp_frame;
 			g_md_state.game_frames++;
@@ -251,26 +243,30 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 					g_md_state.game_frames, eh, enz);
 			}
 
-			// Re-collect every ~5 min to catch address changes
-			// Smart cache mode: skip re-collect (no dynamic pointers in Genesis)
-			int re_collect = !achievements_smart_cache_enabled()
-				&& (g_md_state.game_frames % 18000 == 0) && (g_md_state.game_frames > 0);
-			if (re_collect) {
-				g_md_state.collecting = 1;
-				ra_snes_addrlist_begin_collect();
-			}
+			// Skip achievement processing while a recollect revision is in
+			// flight (newly collected addresses would read as 0).
+			if (ra_snes_addrlist_is_ready(map)) {
+				// Re-collect every ~5 min to catch address changes
+				// Smart cache mode: skip re-collect (no dynamic pointers in Genesis)
+				int re_collect = !achievements_smart_cache_enabled()
+					&& (g_md_state.game_frames % 18000 == 0) && (g_md_state.game_frames > 0);
+				if (re_collect) {
+					g_md_state.collecting = 1;
+					ra_snes_addrlist_begin_collect();
+				}
 
-			rc_client_do_frame(rc_client);
+				rc_client_do_frame(rc_client);
 
-			if (re_collect) {
-				g_md_state.collecting = 0;
-				if (ra_snes_addrlist_end_collect(map)) {
-					ra_log_write("MD OptionC: Address list refreshed, %d addrs\n",
-						ra_snes_addrlist_count());
+				if (re_collect) {
+					g_md_state.collecting = 0;
+					if (ra_snes_addrlist_end_collect(map)) {
+						ra_log_write("MD SelAddr: Address list refreshed, %d addrs\n",
+							ra_snes_addrlist_count());
+					}
 				}
 			}
 		} else {
-			optionc_check_stall_recovery(&g_md_state, resp_frame, "Genesis");
+			seladdr_check_stall_recovery(&g_md_state, resp_frame, "Genesis");
 		}
 	}
 
@@ -315,8 +311,8 @@ static int genesis_detect_protocol(void *map)
 		ra_log_write("Genesis: FPGA mirror not detected -- RA support unavailable\n");
 		return 0;
 	}
-	g_md_state.optionc = 1;
-	ra_log_write("MegaDrive FPGA protocol: Option C (selective address reading)\n");
+	g_md_state.seladdr = 1;
+	ra_log_write("MegaDrive FPGA protocol: Selective Address (selective address reading)\n");
 
 	if (ra_rtquery_supported(map) && achievements_rtquery_enabled()) {
 		g_md_rtquery = 1;

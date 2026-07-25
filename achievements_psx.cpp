@@ -21,7 +21,6 @@
 static console_state_t g_psx_state = {};
 static int g_psx_rtquery = 0; // 1 if FPGA supports realtime queries
 static uint32_t g_psx_rtquery_calls = 0;       // rtquery_read calls since last milestone
-static uint32_t g_psx_rtquery_reindex = 0;     // calls made while cache_reindexing
 static uint32_t g_psx_rtquery_miss = 0;        // calls made from cache-miss path
 // ARM-side activity counters (reset each milestone log).
 static uint32_t g_psx_flush_calls   = 0;       // ra_snes_addrlist_flush_dynamic calls (writes addrlist+request_id to DDR3)
@@ -51,12 +50,18 @@ static uint16_t psx_dbg_delta_u16(uint16_t cur, uint16_t prev) {
 //       size right after bootstrap.
 //
 // Rationale: cleanup is the most expensive ARM-side op (qsort + memcmp +
-// DDR3 writes + cache_reindexing window). When the list is stable or only
-// grew a little, the cleanup work doesn't pay for itself.
+// DDR3 writes). When the list is stable or only grew a little, the cleanup
+// work doesn't pay for itself.
 // ---------------------------------------------------------------------------
 #define PSX_CLEANUP_GROWTH_PCT 50  // run cleanup once count > initial * 1.5
 static uint32_t g_psx_initial_addr_count   = 0;
 static int      g_psx_changes_since_cleanup = 0;
+
+// 1 while the trigger state is primed from an all-zero bootstrap frame; the
+// next cache activation must rc_client_reset to discard it. Legacy recollects
+// re-enter the activation phase with REAL values, where a reset would only
+// throw away hit counts — hence a flag instead of an unconditional reset.
+static int g_psx_boot_zero = 0;
 
 // ---------------------------------------------------------------------------
 // Flat-array RAM mirror (PSX-specific O(1) lookup).
@@ -103,13 +108,27 @@ static inline uint8_t psx_mirror_lookup(uint32_t addr, int *hit)
 // Rebuild the monitored flags from the current sorted address list. Called
 // after bootstrap or cleanup-style end_collect, when the entire list may
 // have changed in one shot.
-static void psx_mirror_rebuild_flags(void)
+//
+// values_valid=1 (bootstrap): mark every listed address — the mirror values
+// are filled by psx_mirror_sync before any read happens (cache_ready gates).
+// values_valid=0 (cleanup): only addresses that were already monitored keep
+// the flag. A genuinely-new address must NOT be marked yet: its mirror byte
+// is stale garbage, and a marked lookup would return it as a "hit". Left
+// unmonitored, it misses to rtquery, which stores a real value and marks it.
+static void psx_mirror_rebuild_flags(int values_valid)
 {
-	memset(g_psx_ram_monitored, 0, sizeof(g_psx_ram_monitored));
 	int count = ra_snes_addrlist_count();
 	const uint32_t *addrs = ra_snes_addrlist_addrs();
-	for (int i = 0; i < count; i++)
-		psx_mirror_mark_monitored(addrs[i]);
+	static uint8_t keep[RA_SNES_MAX_ADDRS];
+	if (!values_valid) {
+		for (int i = 0; i < count; i++)
+			keep[i] = (addrs[i] < PSX_RAM_SIZE) ? g_psx_ram_monitored[addrs[i]] : 0;
+	}
+	memset(g_psx_ram_monitored, 0, sizeof(g_psx_ram_monitored));
+	for (int i = 0; i < count; i++) {
+		if (values_valid || keep[i])
+			psx_mirror_mark_monitored(addrs[i]);
+	}
 }
 
 // Pull the freshest values from the FPGA's valcache (DDR3, memory-mapped)
@@ -117,16 +136,16 @@ static void psx_mirror_rebuild_flags(void)
 //
 // Gated on is_ready(map): if the FPGA hasn't yet processed our latest
 // request_id (after add_dynamic+flush or end_collect), the valcache still
-// reflects the OLD list ordering and copying it through our NEW s_snes_addrs[]
-// would corrupt the mirror. Skip the sync in that case and let the mirror
-// stay one frame stale until the FPGA catches up.
+// reflects the OLD list ordering. Iterate the ACTIVE snapshot — the pending
+// list may already contain unpublished insertions that would shift the
+// index-to-address pairing and corrupt the mirror.
 static void psx_mirror_sync(const void *map)
 {
 	if (!map) return;
 	if (!ra_snes_addrlist_is_ready(map)) return;
 	const uint8_t *vals  = (const uint8_t *)map + RA_SNES_VALCACHE_OFFSET + 8;
-	int            count = ra_snes_addrlist_count();
-	const uint32_t *addrs = ra_snes_addrlist_addrs();
+	int            count = ra_snes_addrlist_active_count();
+	const uint32_t *addrs = ra_snes_addrlist_active_addrs();
 	for (int i = 0; i < count; i++) {
 		uint32_t a = addrs[i];
 		if (a < PSX_RAM_SIZE) g_psx_ram_mirror[a] = vals[i];
@@ -142,10 +161,10 @@ static void psx_mirror_reset(void)
 
 
 // ---------------------------------------------------------------------------
-// PSX Option C Diagnostics
+// PSX Selective Address Diagnostics
 // ---------------------------------------------------------------------------
 
-static void psx_optionc_dump_valcache(const char *label, void *map)
+static void psx_seladdr_dump_valcache(const char *label, void *map)
 {
 	if (!map) return;
 	const uint8_t *base = (const uint8_t *)map;
@@ -180,7 +199,6 @@ static void psx_init(void)
 	g_psx_rtquery = 0;
 	g_psx_rtquery_calls = 0;
 	g_psx_rtquery_miss = 0;
-	g_psx_rtquery_reindex = 0;
 	g_psx_flush_calls = 0;
 	g_psx_collect_calls = 0;
 	g_psx_list_changes = 0;
@@ -194,6 +212,7 @@ static void psx_init(void)
 	g_psx_prev_qry_serves = 0;
 	g_psx_initial_addr_count   = 0;
 	g_psx_changes_since_cleanup = 0;
+	g_psx_boot_zero = 0;
 	psx_mirror_reset();
 }
 
@@ -203,7 +222,6 @@ static void psx_reset(void)
 	g_psx_rtquery = 0;
 	g_psx_rtquery_calls = 0;
 	g_psx_rtquery_miss = 0;
-	g_psx_rtquery_reindex = 0;
 	g_psx_flush_calls = 0;
 	g_psx_collect_calls = 0;
 	g_psx_list_changes = 0;
@@ -217,37 +235,22 @@ static void psx_reset(void)
 	g_psx_prev_qry_serves = 0;
 	g_psx_initial_addr_count   = 0;
 	g_psx_changes_since_cleanup = 0;
+	g_psx_boot_zero = 0;
 	psx_mirror_reset();
 }
 
 static uint32_t psx_read_memory(void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes)
 {
-	if (g_psx_state.optionc) {
+	if (g_psx_state.seladdr) {
 		if (g_psx_state.collecting) {
 			for (uint32_t i = 0; i < num_bytes; i++)
 				ra_snes_addrlist_add(address + i);
 		}
 		if (g_psx_state.cache_ready) {
 			if (achievements_smart_cache_enabled() && g_psx_rtquery) {
-				// During reindexing (after cleanup prune), FPGA cache indices are stale.
-				// Use rtquery for all reads until FPGA responds with updated indices.
-				if (g_psx_state.cache_reindexing) {
-					if (num_bytes <= 4) {
-						g_psx_rtquery_calls++;
-						g_psx_rtquery_reindex++;
-						uint32_t val = ra_rtquery_read(map, address, num_bytes);
-						for (uint32_t i = 0; i < num_bytes; i++)
-							buffer[i] = (uint8_t)(val >> (i * 8));
-						return num_bytes;
-					}
-					for (uint32_t i = 0; i < num_bytes; i++) {
-						g_psx_rtquery_calls++;
-						g_psx_rtquery_reindex++;
-						uint32_t val = ra_rtquery_read(map, address + i, 1);
-						buffer[i] = (uint8_t)val;
-					}
-					return num_bytes;
-				}
+				// List-change misalignment cannot corrupt the flat mirror: it is
+				// keyed by address and psx_mirror_sync only copies the valcache
+				// while is_ready (FPGA confirmed the current list ordering).
 				// Flat-mirror lookup: O(1) per byte via psx_mirror_lookup
 				// (monitored-flag check + value load). Replaces the binary
 				// search of ra_snes_addrlist_lookup_byte. The mirror is kept
@@ -321,7 +324,7 @@ static uint32_t psx_read_memory(void *map, uint32_t address, uint8_t *buffer, ui
 static int psx_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
-	if (!client || !game_loaded || !map || !g_psx_state.optionc) return 0;
+	if (!client || !game_loaded || !map || !g_psx_state.seladdr) return 0;
 
 	rc_client_t *rc_client = (rc_client_t *)client;
 
@@ -331,7 +334,11 @@ static int psx_poll(void *map, void *client, int game_loaded)
 	if (achievements_smart_cache_enabled() && g_psx_rtquery) {
 
 		if (ra_snes_addrlist_count() == 0 && !g_psx_state.cache_ready) {
-			// Phase 1: Bootstrap — collect addresses (values come from rtquery)
+			// Phase 1: Bootstrap — reads return zero during collection.
+			// Re-prime to WAITING first so active triggers (mid-game
+			// re-bootstrap after stall recovery) cannot fire on zeros.
+			rc_client_reset(rc_client);
+			g_psx_boot_zero = 1;
 			g_psx_state.collecting = 1;
 			ra_snes_addrlist_begin_collect();
 			rc_client_do_frame(rc_client);
@@ -339,7 +346,7 @@ static int psx_poll(void *map, void *client, int game_loaded)
 			int changed = ra_snes_addrlist_end_collect(map);
 			if (changed) {
 				// Initialize the flat mirror monitored flags from bootstrap list.
-				psx_mirror_rebuild_flags();
+				psx_mirror_rebuild_flags(1);
 				ra_log_write("PSX SmartCache: Bootstrap done, %d addrs written to DDRAM\n",
 					ra_snes_addrlist_count());
 			} else {
@@ -360,21 +367,18 @@ static int psx_poll(void *map, void *client, int game_loaded)
 				g_psx_changes_since_cleanup = 0;
 				// First-time mirror fill from the valcache the FPGA just wrote.
 				psx_mirror_sync(map);
-				ra_log_write("PSX SmartCache: Cache active! %d addrs monitored (initial=%u)\n",
+				// Discard the zero-primed bootstrap state (delta conditions
+				// would otherwise see 0 -> real transitions and fire).
+				rc_client_reset(rc_client);
+				g_psx_boot_zero = 0;
+				ra_log_write("PSX SmartCache: Cache active! %d addrs monitored (initial=%u, rc_client reset)\n",
 					ra_snes_addrlist_count(), g_psx_initial_addr_count);
-				psx_optionc_dump_valcache("smart-active", map);
+				psx_seladdr_dump_valcache("smart-active", map);
 			}
 		} else {
 			// Phase 3: Normal — cache miss handled in read_memory via rtquery
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-			optionc_resync_if_backward(&g_psx_state, resp_frame, "PSX");
-
-			// Check if FPGA responded after cleanup reindex
-			if (g_psx_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
-				g_psx_state.cache_reindexing = 0;
-				ra_log_write("PSX SmartCache: Reindex complete, FPGA cache synced (%d addrs)\n",
-					ra_snes_addrlist_count());
-			}
+			seladdr_resync_if_backward(&g_psx_state, resp_frame, "PSX");
 
 			if (resp_frame > g_psx_state.last_resp_frame) {
 				g_psx_state.last_resp_frame = resp_frame;
@@ -399,7 +403,7 @@ static int psx_poll(void *map, void *client, int game_loaded)
 					* (uint32_t)(100 + PSX_CLEANUP_GROWTH_PCT)) / 100u;
 				int cleanup_frame = (g_psx_state.game_frames % 600 == 0)
 					&& (g_psx_state.game_frames > 0)
-					&& !g_psx_state.cache_reindexing
+					&& ra_snes_addrlist_is_ready(map)
 					&& (g_psx_changes_since_cleanup > 0)
 					&& ((uint32_t)ra_snes_addrlist_count() > growth_threshold);
 				if (cleanup_frame) {
@@ -429,13 +433,12 @@ static int psx_poll(void *map, void *client, int game_loaded)
 						int pruned = old_count - new_count;
 						g_psx_list_changes++;
 						// List was replaced wholesale — rebuild the mirror
-						// monitored flags from the new list (clears for pruned
-						// addresses, sets for any newly captured ones).
-						psx_mirror_rebuild_flags();
+						// monitored flags (preserve-only: newly captured
+						// addresses have no valid mirror byte yet, so they
+						// stay unmonitored and self-heal via rtquery misses).
+						psx_mirror_rebuild_flags(0);
 						ra_log_write("PSX SmartCache: Cleanup — pruned %d stale addrs (%d -> %d)\n",
 							pruned, old_count, new_count);
-						// FPGA cache indices are now stale — use rtquery until FPGA responds
-						g_psx_state.cache_reindexing = 1;
 					}
 					// Reset the gate regardless of whether end_collect detected a
 					// change. A cleanup attempt counts as having reconciled.
@@ -479,16 +482,15 @@ static int psx_poll(void *map, void *client, int game_loaded)
 				? (g_psx_doframe_total_ns / g_psx_doframe_count) / 1000ULL
 				: 0;
 			uint64_t max_us = g_psx_doframe_max_ns / 1000ULL;
-			ra_log_write("POLL(PSX-SC): resp_frame=%u game_frames=%u elapsed=%.1fs ms/cycle=%.1f addrs=%d reindexing=%d rtq=%u(m=%u r=%u) ARM[flush=%u col=%u chg=%u miss=%u dofrm_avg=%lluus max=%lluus] FPGA[bram_hit=%u bram_miss=%u qry_poll=%u qry_serve=%u]\n",
+			ra_log_write("POLL(PSX-SC): resp_frame=%u game_frames=%u elapsed=%.1fs ms/cycle=%.1f addrs=%d rtq=%u(m=%u) ARM[flush=%u col=%u chg=%u miss=%u dofrm_avg=%lluus max=%lluus] FPGA[bram_hit=%u bram_miss=%u qry_poll=%u qry_serve=%u]\n",
 				g_psx_state.last_resp_frame, g_psx_state.game_frames, elapsed, ms_per_cycle,
-				ra_snes_addrlist_count(), g_psx_state.cache_reindexing,
-				g_psx_rtquery_calls, g_psx_rtquery_miss, g_psx_rtquery_reindex,
+				ra_snes_addrlist_count(),
+				g_psx_rtquery_calls, g_psx_rtquery_miss,
 				g_psx_flush_calls, g_psx_collect_calls, g_psx_list_changes, g_psx_addmiss_total,
 				(unsigned long long)avg_us, (unsigned long long)max_us,
 				d_hits, d_miss, d_polls, d_serves);
 			g_psx_rtquery_calls = 0;
 			g_psx_rtquery_miss = 0;
-			g_psx_rtquery_reindex = 0;
 			g_psx_flush_calls = 0;
 			g_psx_collect_calls = 0;
 			g_psx_list_changes = 0;
@@ -497,7 +499,7 @@ static int psx_poll(void *map, void *client, int game_loaded)
 			g_psx_doframe_max_ns = 0;
 			g_psx_doframe_count = 0;
 			if ((g_psx_state.game_frames % 1800) < 300)
-				psx_optionc_dump_valcache("periodic-sc", map);
+				psx_seladdr_dump_valcache("periodic-sc", map);
 		}
 
 		return 1;
@@ -508,7 +510,10 @@ static int psx_poll(void *map, void *client, int game_loaded)
 	// ===================================================================
 
 	if (ra_snes_addrlist_count() == 0 && !g_psx_state.cache_ready) {
-		// Phase 1: Bootstrap — collect addresses with zero values
+		// Phase 1: Bootstrap — collect addresses with zero values.
+		// Re-prime to WAITING first (see smart-cache bootstrap).
+		rc_client_reset(rc_client);
+		g_psx_boot_zero = 1;
 		g_psx_state.collecting = 1;
 		ra_snes_addrlist_begin_collect();
 		rc_client_do_frame(rc_client);
@@ -516,11 +521,11 @@ static int psx_poll(void *map, void *client, int game_loaded)
 		int changed = ra_snes_addrlist_end_collect(map);
 		if (changed) {
 			g_psx_state.needs_recollect = 1;
-			ra_log_write("PSX OptionC: Bootstrap collection done, %d addrs written to DDRAM\n",
+			ra_log_write("PSX SelAddr: Bootstrap collection done, %d addrs written to DDRAM\n",
 				ra_snes_addrlist_count());
-			psx_optionc_dump_valcache("bootstrap", map);
+			psx_seladdr_dump_valcache("bootstrap", map);
 		} else {
-			ra_log_write("PSX OptionC: No addresses collected\n");
+			ra_log_write("PSX SelAddr: No addresses collected\n");
 		}
 	} else if (!g_psx_state.cache_ready) {
 		// Phase 2/4: Wait for FPGA cache
@@ -530,12 +535,18 @@ static int psx_poll(void *map, void *client, int game_loaded)
 			g_psx_state.game_frames = 0;
 			g_psx_state.poll_logged = 0;
 			clock_gettime(CLOCK_MONOTONIC, &g_psx_state.cache_time);
+			// Only the activation right after a zero-read bootstrap needs the
+			// re-prime; recollect re-activations ran with real values.
+			if (g_psx_boot_zero) {
+				rc_client_reset(rc_client);
+				g_psx_boot_zero = 0;
+			}
 			if (g_psx_state.needs_recollect) {
-				ra_log_write("PSX OptionC: Cache active (pre-recollect). Will resolve pointers.\n");
-				psx_optionc_dump_valcache("pre-recollect", map);
+				ra_log_write("PSX SelAddr: Cache active (pre-recollect). Will resolve pointers.\n");
+				psx_seladdr_dump_valcache("pre-recollect", map);
 			} else {
-				ra_log_write("PSX OptionC: Cache active! FPGA response matched request.\n");
-				psx_optionc_dump_valcache("cache-active", map);
+				ra_log_write("PSX SelAddr: Cache active! FPGA response matched request.\n");
+				psx_seladdr_dump_valcache("cache-active", map);
 			}
 		}
 	} else if (g_psx_state.needs_recollect) {
@@ -547,17 +558,17 @@ static int psx_poll(void *map, void *client, int game_loaded)
 		g_psx_state.collecting = 0;
 		int changed = ra_snes_addrlist_end_collect(map);
 		if (changed) {
-			ra_log_write("PSX OptionC: Pointer-resolve re-collection done, %d addrs (changed)\n",
+			ra_log_write("PSX SelAddr: Pointer-resolve re-collection done, %d addrs (changed)\n",
 				ra_snes_addrlist_count());
 			g_psx_state.cache_ready = 0;
-			psx_optionc_dump_valcache("ptr-resolve", map);
+			psx_seladdr_dump_valcache("ptr-resolve", map);
 		} else {
-			ra_log_write("PSX OptionC: Pointer-resolve complete, no address changes\n");
+			ra_log_write("PSX SelAddr: Pointer-resolve complete, no address changes\n");
 		}
 	} else {
 		// Phase 5: Normal frame processing
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-		optionc_resync_if_backward(&g_psx_state, resp_frame, "PSX");
+		seladdr_resync_if_backward(&g_psx_state, resp_frame, "PSX");
 		if (resp_frame > g_psx_state.last_resp_frame) {
 			g_psx_state.last_resp_frame = resp_frame;
 			g_psx_state.game_frames++;
@@ -566,9 +577,9 @@ static int psx_poll(void *map, void *client, int game_loaded)
 			g_psx_state.stall_frame = resp_frame;
 
 			if (g_psx_state.game_frames <= 5) {
-				ra_log_write("PSX OptionC: GameFrame %u (resp_frame=%u)\n",
+				ra_log_write("PSX SelAddr: GameFrame %u (resp_frame=%u)\n",
 					g_psx_state.game_frames, resp_frame);
-				psx_optionc_dump_valcache("early-frame", map);
+				psx_seladdr_dump_valcache("early-frame", map);
 			}
 
 			// Re-collect every N frames to track pointer changes (configurable)
@@ -596,13 +607,13 @@ static int psx_poll(void *map, void *client, int game_loaded)
 				g_psx_state.collecting = 0;
 				if (ra_snes_addrlist_end_collect(map)) {
 					g_psx_list_changes++;
-					ra_log_write("PSX OptionC: Address list refreshed, %d addrs\n",
+					ra_log_write("PSX SelAddr: Address list refreshed, %d addrs\n",
 						ra_snes_addrlist_count());
 					g_psx_state.cache_ready = 0;
 				}
 			}
 		} else {
-			optionc_check_stall_recovery(&g_psx_state, resp_frame, "PSX");
+			seladdr_check_stall_recovery(&g_psx_state, resp_frame, "PSX");
 		}
 	}
 
@@ -646,7 +657,7 @@ static int psx_poll(void *map, void *client, int game_loaded)
 		g_psx_doframe_max_ns = 0;
 		g_psx_doframe_count = 0;
 		if ((g_psx_state.game_frames % 1800) < 300)
-			psx_optionc_dump_valcache("periodic", map);
+			psx_seladdr_dump_valcache("periodic", map);
 	}
 
 	return 1; // PSX handled
@@ -688,9 +699,9 @@ static int psx_detect_protocol(void *map)
 		ra_log_write("PSX: FPGA mirror not detected -- RA support unavailable\n");
 		return 0;
 	}
-	// PSX always uses Option C (no VBlank-gated mode)
-	g_psx_state.optionc = 1;
-	ra_log_write("PSX FPGA protocol: Option C (selective address reading)\n");
+	// PSX always uses Selective Address (no VBlank-gated mode)
+	g_psx_state.seladdr = 1;
+	ra_log_write("PSX FPGA protocol: Selective Address (selective address reading)\n");
 
 	if (ra_rtquery_supported(map) && achievements_rtquery_enabled()) {
 		g_psx_rtquery = 1;

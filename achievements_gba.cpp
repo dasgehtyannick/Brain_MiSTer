@@ -29,10 +29,10 @@ static int g_gba_rtquery = 0; // 1 if FPGA supports realtime queries (core v2+)
 static void *g_gba_last_map = NULL;
 
 // ---------------------------------------------------------------------------
-// GBA Option C Diagnostics
+// GBA Selective Address Diagnostics
 // ---------------------------------------------------------------------------
 
-static void gba_optionc_dump_valcache(const char *label, void *map)
+static void gba_seladdr_dump_valcache(const char *label, void *map)
 {
         if (!map) return;
         const uint8_t *base = (const uint8_t *)map;
@@ -96,7 +96,7 @@ static void gba_reset(void)
 
 static uint32_t gba_read_memory(void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes)
 {
-        if (!g_gba_state.optionc)
+        if (!g_gba_state.seladdr)
                 return 0;
 
         if (g_gba_state.collecting) {
@@ -113,21 +113,10 @@ static uint32_t gba_read_memory(void *map, uint32_t address, uint8_t *buffer, ui
                                 memset(buffer, 0, num_bytes);
                                 return num_bytes;
                         }
-                        // While the FPGA is re-syncing to a new address list the
-                        // valcache still reflects the OLD list ordering — indexed
-                        // reads would return the neighbour's byte. Use rtquery for
-                        // everything until the response_id matches again.
-                        if (g_gba_state.cache_reindexing) {
-                                if (num_bytes <= 4) {
-                                        uint32_t val = ra_rtquery_read(map, address, num_bytes);
-                                        for (uint32_t i = 0; i < num_bytes; i++)
-                                                buffer[i] = (uint8_t)(val >> (i * 8));
-                                        return num_bytes;
-                                }
-                                for (uint32_t i = 0; i < num_bytes; i++)
-                                        buffer[i] = (uint8_t)ra_rtquery_read(map, address + i, 1);
-                                return num_bytes;
-                        }
+                        // List-change misalignment is handled inside
+                        // ra_snes_addrlist_* (active-snapshot mapping): cached
+                        // lookups always follow the ordering the FPGA confirmed,
+                        // so no rtquery-all reindex window is needed.
                         // Smart Cache: batch-cached bytes come from the valcache;
                         // misses are answered by rtquery and scheduled for the
                         // FPGA batch via add_dynamic.
@@ -186,7 +175,7 @@ static uint32_t gba_read_memory(void *map, uint32_t address, uint8_t *buffer, ui
 static int gba_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
-        if (!client || !game_loaded || !map || !g_gba_state.optionc)
+        if (!client || !game_loaded || !map || !g_gba_state.seladdr)
                 return 0;
 
         g_gba_last_map = map;
@@ -200,7 +189,10 @@ static int gba_poll(void *map, void *client, int game_loaded)
         if (achievements_smart_cache_enabled() && g_gba_rtquery) {
 
                 if (ra_snes_addrlist_count() == 0 && !g_gba_state.cache_ready) {
-                        // Phase 1: Bootstrap (reads answered via rtquery fallback)
+                        // Phase 1: Bootstrap (reads return zero during collection).
+                        // Re-prime to WAITING first so active triggers (mid-game
+                        // re-bootstrap after stall recovery) cannot fire on zeros.
+                        rc_client_reset(rc_client);
                         g_gba_state.collecting = 1;
                         ra_snes_addrlist_begin_collect();
                         rc_client_do_frame(rc_client);
@@ -226,18 +218,12 @@ static int gba_poll(void *map, void *client, int game_loaded)
                                 rc_client_reset(rc_client);
                                 ra_log_write("GBA SmartCache: Cache active! %d addrs monitored (rc_client reset)\n",
                                         ra_snes_addrlist_count());
-                                gba_optionc_dump_valcache("smart-active", map);
+                                gba_seladdr_dump_valcache("smart-active", map);
                         }
                 } else {
                         // Phase 3: Normal — cache miss handled in read_memory
                         uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-                        optionc_resync_if_backward(&g_gba_state, resp_frame, "GBA");
-
-                        if (g_gba_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
-                                g_gba_state.cache_reindexing = 0;
-                                ra_log_write("GBA SmartCache: Reindex complete (%d addrs)\n",
-                                        ra_snes_addrlist_count());
-                        }
+                        seladdr_resync_if_backward(&g_gba_state, resp_frame, "GBA");
 
                         if (resp_frame > g_gba_state.last_resp_frame) {
                                 g_gba_state.last_resp_frame = resp_frame;
@@ -258,22 +244,17 @@ static int gba_poll(void *map, void *client, int game_loaded)
                                 // re-add themselves via rtquery misses next frame.
                                 if (achievements_smart_cleanup_enabled()
                                                 && (g_gba_state.game_frames % 3600 == 0)
-                                                && !g_gba_state.cache_reindexing
                                                 && ra_snes_addrlist_dyn_count() > 128) {
                                         int removed = ra_snes_addrlist_prune_dynamic(map);
                                         if (removed) {
                                                 ra_log_write("GBA SmartCache: pruned %d dynamic addrs (%d static kept)\n",
                                                         removed, ra_snes_addrlist_count());
-                                                g_gba_state.cache_reindexing = 1;
                                         }
                                 } else if (ra_snes_addrlist_has_pending()) {
-                                        // List order changed: reads go through rtquery
-                                        // until the FPGA answers with the new index order.
-                                        if (ra_snes_addrlist_flush_dynamic(map))
-                                                g_gba_state.cache_reindexing = 1;
+                                        ra_snes_addrlist_flush_dynamic(map);
                                 }
                         } else {
-                                optionc_check_stall_recovery(&g_gba_state, resp_frame, "GBA");
+                                seladdr_check_stall_recovery(&g_gba_state, resp_frame, "GBA");
                         }
                 }
 
@@ -287,12 +268,11 @@ static int gba_poll(void *map, void *client, int game_loaded)
                                 + (now.tv_nsec - g_gba_state.cache_time.tv_nsec) / 1e9;
                         double ms_per_cycle = (g_gba_state.game_frames > 0) ?
                                 (elapsed * 1000.0 / g_gba_state.game_frames) : 0.0;
-                        ra_log_write("POLL(GBA-SC): resp_frame=%u game_frames=%u elapsed=%.1fs ms/cycle=%.1f addrs=%d dyn=%d reindexing=%d\n",
+                        ra_log_write("POLL(GBA-SC): resp_frame=%u game_frames=%u elapsed=%.1fs ms/cycle=%.1f addrs=%d dyn=%d\n",
                                 g_gba_state.last_resp_frame, g_gba_state.game_frames, elapsed, ms_per_cycle,
-                                ra_snes_addrlist_count(), ra_snes_addrlist_dyn_count(),
-                                g_gba_state.cache_reindexing);
+                                ra_snes_addrlist_count(), ra_snes_addrlist_dyn_count());
                         if ((g_gba_state.game_frames % 1800) < 300)
-                                gba_optionc_dump_valcache("periodic-sc", map);
+                                gba_seladdr_dump_valcache("periodic-sc", map);
                 }
 
                 return 1;
@@ -303,18 +283,21 @@ static int gba_poll(void *map, void *client, int game_loaded)
         // ===================================================================
 
         if (ra_snes_addrlist_count() == 0 && !g_gba_state.cache_ready) {
-                // Bootstrap: run one do_frame with zeros to discover needed addresses
+                // Bootstrap: run one do_frame with zeros to discover needed addresses.
+                // Re-prime to WAITING first so active triggers (mid-game re-bootstrap
+                // after stall recovery) cannot fire on the all-zero reads.
+                rc_client_reset(rc_client);
                 g_gba_state.collecting = 1;
                 ra_snes_addrlist_begin_collect();
                 rc_client_do_frame(rc_client);
                 g_gba_state.collecting = 0;
                 int changed = ra_snes_addrlist_end_collect(map);
                 if (changed) {
-                        ra_log_write("GBA OptionC: Bootstrap collection done, %d addrs written to DDRAM\n",
+                        ra_log_write("GBA SelAddr: Bootstrap collection done, %d addrs written to DDRAM\n",
                                 ra_snes_addrlist_count());
-                        gba_optionc_dump_valcache("bootstrap", map);
+                        gba_seladdr_dump_valcache("bootstrap", map);
                 } else {
-                        ra_log_write("GBA OptionC: No addresses collected\n");
+                        ra_log_write("GBA SelAddr: No addresses collected\n");
                 }
         } else if (!g_gba_state.cache_ready) {
                 // Wait for FPGA response
@@ -328,22 +311,13 @@ static int gba_poll(void *map, void *client, int game_loaded)
                         // achievement already satisfied by the real state cannot pop
                         // on the first genuine frame.
                         rc_client_reset(rc_client);
-                        ra_log_write("GBA OptionC: Cache active! FPGA response matched request (rc_client reset).\n");
-                        gba_optionc_dump_valcache("cache-active", map);
+                        ra_log_write("GBA SelAddr: Cache active! FPGA response matched request (rc_client reset).\n");
+                        gba_seladdr_dump_valcache("cache-active", map);
                 }
         } else {
                 // Normal frame processing from cache
                 uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-                optionc_resync_if_backward(&g_gba_state, resp_frame, "GBA");
-
-                // After a recollect changed the list, the valcache is misaligned
-                // (old ordering) until the FPGA answers the new request_id. Skip
-                // achievement processing for those 1-2 frames.
-                if (g_gba_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
-                        g_gba_state.cache_reindexing = 0;
-                        ra_log_write("GBA OptionC: Recollect sync complete (%d addrs)\n",
-                                ra_snes_addrlist_count());
-                }
+                seladdr_resync_if_backward(&g_gba_state, resp_frame, "GBA");
 
                 if (resp_frame > g_gba_state.last_resp_frame) {
                         g_gba_state.last_resp_frame = resp_frame;
@@ -353,12 +327,17 @@ static int gba_poll(void *map, void *client, int game_loaded)
                         g_gba_state.stall_frame = resp_frame;
 
                         if (g_gba_state.game_frames <= 5) {
-                                ra_log_write("GBA OptionC: GameFrame %u (resp_frame=%u)\n",
+                                ra_log_write("GBA SelAddr: GameFrame %u (resp_frame=%u)\n",
                                         g_gba_state.game_frames, resp_frame);
-                                gba_optionc_dump_valcache("early-frame", map);
+                                gba_seladdr_dump_valcache("early-frame", map);
                         }
 
-                        if (!g_gba_state.cache_reindexing) {
+                        // While a list revision is in flight (recollect published,
+                        // FPGA not yet confirmed) newly collected addresses would
+                        // read as 0 — skip achievement processing for those 1-2
+                        // frames. Addresses from the confirmed snapshot stay valid
+                        // throughout, so nothing else is lost.
+                        if (ra_snes_addrlist_is_ready(map)) {
                                 // Periodic re-collect catches AddAddress pointer moves
                                 // (Pokémon SaveBlock relocation) without rtquery support.
                                 uint32_t interval = (uint32_t)achievements_recollect_interval();
@@ -375,14 +354,13 @@ static int gba_poll(void *map, void *client, int game_loaded)
                                 if (re_collect) {
                                         g_gba_state.collecting = 0;
                                         if (ra_snes_addrlist_end_collect(map)) {
-                                                g_gba_state.cache_reindexing = 1;
-                                                ra_log_write("GBA OptionC: Address list refreshed, %d addrs\n",
+                                                ra_log_write("GBA SelAddr: Address list refreshed, %d addrs\n",
                                                         ra_snes_addrlist_count());
                                         }
                                 }
                         }
                 } else {
-                	optionc_check_stall_recovery(&g_gba_state, resp_frame, "GBA");
+                	seladdr_check_stall_recovery(&g_gba_state, resp_frame, "GBA");
                 }
         }
 
@@ -400,10 +378,10 @@ static int gba_poll(void *map, void *client, int game_loaded)
                         g_gba_state.last_resp_frame, g_gba_state.game_frames, elapsed, ms_per_cycle,
                         ra_snes_addrlist_count());
                 if ((g_gba_state.game_frames % 1800) < 300)
-                        gba_optionc_dump_valcache("periodic", map);
+                        gba_seladdr_dump_valcache("periodic", map);
         }
 
-        return 1; // GBA Option C handled
+        return 1; // GBA Selective Address handled
 #else
         return 0;
 #endif
@@ -415,7 +393,7 @@ void gba_dump_trigger(uint32_t ach_id)
         if (!g_gba_last_map) return;
         char label[32];
         snprintf(label, sizeof(label), "trigger-%u", ach_id);
-        gba_optionc_dump_valcache(label, g_gba_last_map);
+        gba_seladdr_dump_valcache(label, g_gba_last_map);
 #endif
 }
 
@@ -495,8 +473,8 @@ static int gba_detect_protocol(void *map)
                 ra_log_write("GBA: FPGA mirror not detected -- RA support unavailable\n");
                 return 0;
         }
-        // GBA always uses Option C
-        g_gba_state.optionc = 1;
+        // GBA always uses Selective Address
+        g_gba_state.seladdr = 1;
         gba_init_flash_ddram();
         if (achievements_gba_reset_ram())
                 ra_clear_en_set(map);    // FPGA clears IWRAM/EWRAM + fills flash on game load
@@ -515,7 +493,7 @@ static int gba_detect_protocol(void *map)
                 ra_log_write("GBA: Realtime queries NOT supported (FPGA v1)\n");
         }
 
-        ra_log_write("GBA FPGA protocol: Option C (%s)\n",
+        ra_log_write("GBA FPGA protocol: Selective Address (%s)\n",
                 g_gba_rtquery ? "smart cache + rtquery" : "selective address reading");
         return 1;
 }

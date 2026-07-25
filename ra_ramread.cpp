@@ -302,7 +302,7 @@ void ra_ramread_debug_status(const void *map)
 }
 
 // ======================================================================
-// Option C: Selective Address Reading (SNES)
+// Selective Address Reading (shared "SNES-style" addrlist)
 // ======================================================================
 
 static int s_addr_cmp(const void *a, const void *b)
@@ -318,6 +318,58 @@ static int      s_snes_dyn_count = 0;               // how many entries have the
 static int      s_snes_addr_count = 0;
 static uint32_t s_snes_request_id = 0;
 static int      s_snes_collecting = 0;
+
+// Active mapping snapshot: the address ordering the FPGA's VALCACHE currently
+// follows (the list revision it last confirmed via response_id). All cached
+// reads (read_cached/lookup_byte/contains) go through this snapshot, never
+// through the live pending list: a list mutation (add_dynamic insert, prune,
+// recollect) shifts indices in the pending list immediately, but the VALCACHE
+// keeps the old ordering until the FPGA picks up the new request_id — indexing
+// it with the new list would return the neighbouring address's byte. Static
+// addresses therefore stay cache-served across every revision; only addresses
+// not yet in the active snapshot fall back to rtquery.
+static uint32_t s_active_addrs[RA_SNES_MAX_ADDRS];
+static int      s_active_count = 0;
+static uint32_t s_active_id = 0;   // request_id the active snapshot reflects (0 = none)
+
+// The list exactly as last written to DDRAM (what s_snes_request_id refers
+// to). The live pending list (s_snes_addrs) keeps mutating between publishes
+// via add_dynamic, so promotion must copy from here, not from the pending
+// list — otherwise unpublished inserts would shift the promoted ordering.
+static uint32_t s_published_addrs[RA_SNES_MAX_ADDRS];
+static int      s_published_count = 0;
+
+static void s_publish_snapshot(void)
+{
+	memcpy(s_published_addrs, s_snes_addrs, s_snes_addr_count * sizeof(uint32_t));
+	s_published_count = s_snes_addr_count;
+}
+
+// Promote published → active when the FPGA has confirmed the current revision.
+// Revisions are serialized (see flush/prune), so response_id is either the
+// active id (transition in flight, keep old mapping) or the current request_id
+// (promote). Any other value means a wholesale list replacement raced the
+// FPGA; end_collect handles that case by invalidating the active snapshot.
+static void s_sync_active(const void *map)
+{
+	if (!map) return;
+	const ra_val_resp_hdr_t *resp =
+		(const ra_val_resp_hdr_t *)((const uint8_t *)map + RA_SNES_VALCACHE_OFFSET);
+	uint32_t rid = resp->response_id;
+	if (rid == s_active_id || rid != s_snes_request_id) return;
+	memcpy(s_active_addrs, s_published_addrs, s_published_count * sizeof(uint32_t));
+	s_active_count = s_published_count;
+	s_active_id = rid;
+}
+
+// 1 when the FPGA has confirmed the latest published list revision.
+static int s_fpga_caught_up(const void *map)
+{
+	if (!map) return 0;
+	const ra_val_resp_hdr_t *resp =
+		(const ra_val_resp_hdr_t *)((const uint8_t *)map + RA_SNES_VALCACHE_OFFSET);
+	return resp->response_id == s_snes_request_id;
+}
 
 // Smart Cache dynamic-add state (see "Smart Cache" section below)
 static int s_dynamic_pending = 0;   // 1 if new addresses added since last flush
@@ -342,6 +394,9 @@ void ra_snes_addrlist_init(void)
 	s_dynamic_pending = 0;
 	s_dynamic_added = 0;
 	s_snes_dyn_count = 0;
+	s_active_count = 0;
+	s_active_id = 0;
+	s_published_count = 0;
 }
 
 void ra_snes_addrlist_begin_collect(void)
@@ -383,12 +438,24 @@ int ra_snes_addrlist_end_collect(void *map)
 	}
 	if (!changed) return 0;
 
+	// A wholesale replacement while a previous revision is still in flight
+	// would leave the VALCACHE ordered by a revision we no longer have a
+	// snapshot of. Invalidate the active snapshot in that (rare) case so
+	// reads miss to rtquery/zero instead of misaligning; the next confirmed
+	// response re-promotes. When the FPGA is caught up (the normal case) the
+	// active snapshot stays valid until the new revision is confirmed.
+	if (s_active_id && !s_fpga_caught_up(map)) {
+		s_active_count = 0;
+		s_active_id = 0;
+	}
+
 	// Update local list — a full collect defines the STATIC baseline
 	memcpy(s_snes_addrs, s_collect_buf, new_count * sizeof(uint32_t));
 	memset(s_snes_addr_dyn, 0, (size_t)new_count);
 	s_snes_dyn_count = 0;
 	s_snes_addr_count = new_count;
 	s_snes_request_id++;
+	s_publish_snapshot();
 
 	// Write to DDRAM
 	if (!map) return 1;
@@ -417,17 +484,18 @@ int ra_snes_addrlist_end_collect(void *map)
 
 uint8_t ra_snes_addrlist_read_cached(const void *map, uint32_t addr)
 {
-	if (!map || s_snes_addr_count == 0) return 0;
+	if (!map || s_active_count == 0) return 0;
 
-	// Binary search
-	int lo = 0, hi = s_snes_addr_count - 1;
+	// Binary search over the ACTIVE snapshot — the ordering the VALCACHE
+	// actually follows (see s_sync_active).
+	int lo = 0, hi = s_active_count - 1;
 	while (lo <= hi) {
 		int mid = (lo + hi) / 2;
-		if (s_snes_addrs[mid] == addr) {
+		if (s_active_addrs[mid] == addr) {
 			const uint8_t *vals = (const uint8_t *)map + RA_SNES_VALCACHE_OFFSET + 8;
 			return vals[mid];
 		}
-		if (s_snes_addrs[mid] < addr) lo = mid + 1;
+		if (s_active_addrs[mid] < addr) lo = mid + 1;
 		else hi = mid - 1;
 	}
 	return 0;
@@ -436,9 +504,8 @@ uint8_t ra_snes_addrlist_read_cached(const void *map, uint32_t addr)
 int ra_snes_addrlist_is_ready(const void *map)
 {
 	if (!map || s_snes_addr_count == 0 || s_snes_request_id == 0) return 0;
-	const uint8_t *base = (const uint8_t *)map;
-	const ra_val_resp_hdr_t *resp = (const ra_val_resp_hdr_t *)(base + RA_SNES_VALCACHE_OFFSET);
-	return resp->response_id == s_snes_request_id;
+	s_sync_active(map);
+	return s_fpga_caught_up(map);
 }
 
 int ra_snes_addrlist_count(void)
@@ -451,6 +518,19 @@ const uint32_t *ra_snes_addrlist_addrs(void)
 	return s_snes_addrs;
 }
 
+// Active (FPGA-confirmed) snapshot — the ordering the VALCACHE follows.
+// Use these when pairing addresses with VALCACHE values by index; the
+// pending accessors above may already contain unpublished insertions.
+int ra_snes_addrlist_active_count(void)
+{
+	return s_active_count;
+}
+
+const uint32_t *ra_snes_addrlist_active_addrs(void)
+{
+	return s_active_addrs;
+}
+
 uint32_t ra_snes_addrlist_request_id(void)
 {
 	return s_snes_request_id;
@@ -459,6 +539,9 @@ uint32_t ra_snes_addrlist_request_id(void)
 uint32_t ra_snes_addrlist_response_frame(const void *map)
 {
 	if (!map) return 0;
+	// Called once per poll by every Selective Address console — piggyback the
+	// pending→active promotion check here so no per-console change is needed.
+	s_sync_active(map);
 	const uint8_t *base = (const uint8_t *)map;
 	const ra_val_resp_hdr_t *resp = (const ra_val_resp_hdr_t *)(base + RA_SNES_VALCACHE_OFFSET);
 	return resp->response_frame;
@@ -504,14 +587,17 @@ void ra_snes_addrlist_diag_dump(const void *map)
 //  state above so ra_snes_addrlist_init can clear them.)
 // ======================================================================
 
+// "Servable from cache" check — searches the ACTIVE snapshot, not the pending
+// list: an address inserted by add_dynamic must keep missing (and thus be
+// served by rtquery) until the FPGA confirms the revision that contains it.
 int ra_snes_addrlist_contains(uint32_t addr)
 {
-	if (s_snes_addr_count == 0) return -1;
-	int lo = 0, hi = s_snes_addr_count - 1;
+	if (s_active_count == 0) return -1;
+	int lo = 0, hi = s_active_count - 1;
 	while (lo <= hi) {
 		int mid = (lo + hi) / 2;
-		if (s_snes_addrs[mid] == addr) return mid;
-		if (s_snes_addrs[mid] < addr) lo = mid + 1;
+		if (s_active_addrs[mid] == addr) return mid;
+		if (s_active_addrs[mid] < addr) lo = mid + 1;
 		else hi = mid - 1;
 	}
 	return -1;
@@ -523,19 +609,19 @@ int ra_snes_addrlist_contains(uint32_t addr)
 // threshold that starves CD-ROM XA streaming and causes audio glitches).
 uint8_t ra_snes_addrlist_lookup_byte(const void *map, uint32_t addr, int *hit)
 {
-	if (!map || s_snes_addr_count == 0) {
+	if (!map || s_active_count == 0) {
 		if (hit) *hit = 0;
 		return 0;
 	}
-	int lo = 0, hi = s_snes_addr_count - 1;
+	int lo = 0, hi = s_active_count - 1;
 	while (lo <= hi) {
 		int mid = (lo + hi) / 2;
-		if (s_snes_addrs[mid] == addr) {
+		if (s_active_addrs[mid] == addr) {
 			const uint8_t *vals = (const uint8_t *)map + RA_SNES_VALCACHE_OFFSET + 8;
 			if (hit) *hit = 1;
 			return vals[mid];
 		}
-		if (s_snes_addrs[mid] < addr) lo = mid + 1;
+		if (s_active_addrs[mid] < addr) lo = mid + 1;
 		else hi = mid - 1;
 	}
 	if (hit) *hit = 0;
@@ -589,12 +675,19 @@ int ra_snes_addrlist_has_pending(void)
 int ra_snes_addrlist_flush_dynamic(void *map)
 {
 	if (!s_dynamic_pending || !map) return 0;
+	// Serialize revisions: publish only when the FPGA has confirmed the
+	// current one. This guarantees the VALCACHE ordering is always either
+	// the active snapshot or the (single) revision in flight, so cached
+	// reads never misalign. Deferred flushes keep s_dynamic_pending set and
+	// retry next frame; the pending addresses are served by rtquery meanwhile.
+	if (!s_fpga_caught_up(map)) return 0;
 	s_dynamic_pending = 0;
 	int flushed = s_dynamic_added;
 	s_dynamic_added = 0;
 
 	// Bump request ID and write entire list to DDRAM
 	s_snes_request_id++;
+	s_publish_snapshot();
 	uint8_t *base = (uint8_t *)map;
 
 	// Write addresses first
@@ -636,6 +729,10 @@ int ra_snes_addrlist_prune_dynamic(void *map)
 	// Never prune down to an empty list (all-dynamic lists would break the
 	// is_ready/reindex handshake); keep everything instead.
 	if (s_snes_dyn_count >= s_snes_addr_count) return 0;
+	// Same revision serialization as flush_dynamic: defer until the FPGA
+	// confirmed the current list, so the active snapshot stays the only
+	// other ordering in play. Callers retry on a later cleanup tick.
+	if (map && !s_fpga_caught_up(map)) return 0;
 
 	int w = 0;
 	for (int i = 0; i < s_snes_addr_count; i++) {
@@ -653,6 +750,7 @@ int ra_snes_addrlist_prune_dynamic(void *map)
 
 	// Publish the shrunk list (same commit order as flush_dynamic)
 	s_snes_request_id++;
+	s_publish_snapshot();
 	if (map) {
 		uint8_t *base = (uint8_t *)map;
 		uint32_t *addrs = (uint32_t *)(base + RA_SNES_ADDRLIST_OFFSET + 8);
@@ -671,7 +769,7 @@ int ra_snes_addrlist_prune_dynamic(void *map)
 }
 
 // ======================================================================
-// Realtime Query Mailbox (Option C "on steroids")
+// Realtime Query Mailbox (Selective Address "on steroids")
 // ======================================================================
 
 static uint8_t s_rtquery_seq = 0;

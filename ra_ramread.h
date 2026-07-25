@@ -79,13 +79,13 @@ typedef struct __attribute__((packed)) {
 #define RA_SNES_WRAM_SIZE     0x20000   // 128KB
 #define RA_SNES_BSRAM_OFFSET  0x20100   // BSRAM data starts after WRAM
 
-// Option C: Selective address reading (SNES)
+// Selective Address reading (shared addrlist, SNES layout)
 #define RA_SNES_ADDRLIST_OFFSET  0x40000   // ARM → FPGA: address request table
 #define RA_SNES_VALCACHE_OFFSET  0x48000   // FPGA → ARM: value response table
 #define RA_SNES_MAX_ADDRS        4096      // Max tracked addresses
 
 // ======================================================================
-// Realtime Query Mailbox (Option C "on steroids")
+// Realtime Query Mailbox (Selective Address "on steroids")
 // ARM writes query addresses, FPGA reads SDRAM, writes values back.
 // Used for AddAddress pointer resolution during rc_client_do_frame().
 // ======================================================================
@@ -129,7 +129,7 @@ typedef struct __attribute__((packed)) {
         uint32_t reserved;
 } ra_query_resp_t;
 
-// Realtime query API — generic, works with any Option C core
+// Realtime query API — generic, works with any Selective Address core
 void     ra_rtquery_init(void *map);
 void     ra_rtquery_disable(void *map);  // clears RA_ARM_CFG_RTQUERY so FPGA stops polling
 void     ra_clear_en_set(void *map);     // sets   RA_ARM_CFG_CLEAR_EN (FPGA clears IWRAM on game load)
@@ -196,7 +196,7 @@ uint32_t ra_ramread_atari2600_read(const void *map, uint32_t address, uint8_t *b
 uint8_t  ra_ramread_atari7800_byte(const void *map, uint16_t addr);
 uint32_t ra_ramread_atari7800_read(const void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes);
 
-// Option C: Selective address reading (SNES)
+// Selective Address reading (shared addrlist, SNES layout)
 // ARM collects needed addresses from rcheevos, writes list to DDRAM.
 // FPGA reads only those addresses each VBlank. ARM reads cached values.
 void     ra_snes_addrlist_init(void);
@@ -207,6 +207,11 @@ uint8_t  ra_snes_addrlist_read_cached(const void *map, uint32_t addr);
 int      ra_snes_addrlist_is_ready(const void *map);
 int      ra_snes_addrlist_count(void);
 const uint32_t *ra_snes_addrlist_addrs(void);  // Returns pointer to sorted address array
+// Active (FPGA-confirmed) snapshot: the ordering the VALCACHE follows. Use
+// these when pairing addresses with VALCACHE values by index — the pending
+// accessors above may already contain unpublished insertions.
+int      ra_snes_addrlist_active_count(void);
+const uint32_t *ra_snes_addrlist_active_addrs(void);
 uint32_t ra_snes_addrlist_request_id(void);     // Current expected request ID
 uint32_t ra_snes_addrlist_response_frame(const void *map);
 void     ra_snes_addrlist_diag_dump(const void *map);
