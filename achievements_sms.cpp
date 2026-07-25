@@ -35,7 +35,7 @@ static void sms_reset(void)
 
 static uint32_t sms_read_memory(void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes)
 {
-	if (g_sms_state.optionc) {
+	if (g_sms_state.seladdr) {
 		if (g_sms_state.collecting) {
 			for (uint32_t i = 0; i < num_bytes; i++)
 				ra_snes_addrlist_add(address + i);
@@ -54,22 +54,25 @@ static uint32_t sms_read_memory(void *map, uint32_t address, uint8_t *buffer, ui
 static int sms_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
-	if (!client || !game_loaded || !map || !g_sms_state.optionc) return 0;
+	if (!client || !game_loaded || !map || !g_sms_state.seladdr) return 0;
 
 	rc_client_t *rc_client = (rc_client_t *)client;
 
 	if (ra_snes_addrlist_count() == 0 && !g_sms_state.cache_ready) {
-		// Bootstrap: run one do_frame with zeros to discover needed addresses
+		// Bootstrap: run one do_frame with zeros to discover needed addresses.
+		// Re-prime to WAITING first so active triggers (mid-game re-bootstrap
+		// after stall recovery) cannot fire on the all-zero reads.
+		rc_client_reset(rc_client);
 		g_sms_state.collecting = 1;
 		ra_snes_addrlist_begin_collect();
 		rc_client_do_frame(rc_client);
 		g_sms_state.collecting = 0;
 		int changed = ra_snes_addrlist_end_collect(map);
 		if (changed) {
-			ra_log_write("SMS OptionC: Bootstrap collection done, %d addrs written to DDRAM\n",
+			ra_log_write("SMS SelAddr: Bootstrap collection done, %d addrs written to DDRAM\n",
 				ra_snes_addrlist_count());
 		} else {
-			ra_log_write("SMS OptionC: No addresses collected\n");
+			ra_log_write("SMS SelAddr: No addresses collected\n");
 		}
 	} else if (!g_sms_state.cache_ready) {
 		// Wait for FPGA to respond with cached values
@@ -79,7 +82,10 @@ static int sms_poll(void *map, void *client, int game_loaded)
 			g_sms_state.game_frames = 0;
 			g_sms_state.poll_logged = 0;
 			clock_gettime(CLOCK_MONOTONIC, &g_sms_state.cache_time);
-			ra_log_write("SMS OptionC: Cache active! FPGA response matched request.\n");
+			// Discard the zero-primed bootstrap state: delta conditions would
+			// otherwise see 0 -> real transitions on the first genuine frame.
+			rc_client_reset(rc_client);
+			ra_log_write("SMS SelAddr: Cache active! FPGA response matched request (rc_client reset).\n");
 			// Dump address list on activation
 			const uint32_t *a0 = ra_snes_addrlist_addrs();
 			int ac = ra_snes_addrlist_count();
@@ -92,7 +98,7 @@ static int sms_poll(void *map, void *client, int game_loaded)
 	} else {
 		// Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-		optionc_resync_if_backward(&g_sms_state, resp_frame, "SMS");
+		seladdr_resync_if_backward(&g_sms_state, resp_frame, "SMS");
 		if (resp_frame > g_sms_state.last_resp_frame) {
 			g_sms_state.last_resp_frame = resp_frame;
 			g_sms_state.game_frames++;
@@ -100,26 +106,30 @@ static int sms_poll(void *map, void *client, int game_loaded)
 			clock_gettime(CLOCK_MONOTONIC, &g_sms_state.stall_time);
 			g_sms_state.stall_frame = resp_frame;
 
-			// Re-collect every ~5 min to catch address changes
-			// Smart cache mode: skip re-collect (no dynamic pointers in SMS)
-			int re_collect = !achievements_smart_cache_enabled()
-				&& (g_sms_state.game_frames % 18000 == 0) && (g_sms_state.game_frames > 0);
-			if (re_collect) {
-				g_sms_state.collecting = 1;
-				ra_snes_addrlist_begin_collect();
-			}
+			// Skip achievement processing while a recollect revision is in
+			// flight (newly collected addresses would read as 0).
+			if (ra_snes_addrlist_is_ready(map)) {
+				// Re-collect every ~5 min to catch address changes
+				// Smart cache mode: skip re-collect (no dynamic pointers in SMS)
+				int re_collect = !achievements_smart_cache_enabled()
+					&& (g_sms_state.game_frames % 18000 == 0) && (g_sms_state.game_frames > 0);
+				if (re_collect) {
+					g_sms_state.collecting = 1;
+					ra_snes_addrlist_begin_collect();
+				}
 
-			rc_client_do_frame(rc_client);
+				rc_client_do_frame(rc_client);
 
-			if (re_collect) {
-				g_sms_state.collecting = 0;
-				if (ra_snes_addrlist_end_collect(map)) {
-					ra_log_write("SMS OptionC: Address list refreshed, %d addrs\n",
-						ra_snes_addrlist_count());
+				if (re_collect) {
+					g_sms_state.collecting = 0;
+					if (ra_snes_addrlist_end_collect(map)) {
+						ra_log_write("SMS SelAddr: Address list refreshed, %d addrs\n",
+							ra_snes_addrlist_count());
+					}
 				}
 			}
 		} else {
-			optionc_check_stall_recovery(&g_sms_state, resp_frame, "SMS");
+			seladdr_check_stall_recovery(&g_sms_state, resp_frame, "SMS");
 		}
 	}
 
@@ -152,7 +162,9 @@ static int sms_calculate_hash(const char *rom_path, char *md5_hex_out)
 
 static void sms_set_hardcore(int enabled)
 {
-	user_io_status_set("[55]", enabled ? 1 : 0); // hardcore signal
+	// bit 63: hardcore signal (moved from 55 — upstream SMS 20260603+ uses
+	// status[56:55] for USERIO SNAC/Gear2Gear)
+	user_io_status_set("[63]", enabled ? 1 : 0);
 	user_io_status_set("[24]", enabled ? 1 : 0); // disable cheats OSD toggle
 	ra_log_write("SMS: Hardcore mode %s\n", enabled ? "enabled" : "disabled");
 }
@@ -163,9 +175,9 @@ static int sms_detect_protocol(void *map)
 		ra_log_write("SMS: FPGA mirror not detected -- RA support unavailable\n");
 		return 0;
 	}
-	// SMS always uses Option C
-	g_sms_state.optionc = 1;
-	ra_log_write("SMS FPGA protocol: Option C (selective address reading)\n");
+	// SMS always uses Selective Address
+	g_sms_state.seladdr = 1;
+	ra_log_write("SMS FPGA protocol: Selective Address (selective address reading)\n");
 	return 1;
 }
 

@@ -66,26 +66,15 @@ static void gameboy_reset(void)
 
 static uint32_t gameboy_read_memory(void *map, uint32_t address, uint8_t *buffer, uint32_t num_bytes)
 {
-	if (g_gb_state.optionc) {
+	if (g_gb_state.seladdr) {
 		if (g_gb_state.collecting) {
 			for (uint32_t i = 0; i < num_bytes; i++)
 				ra_snes_addrlist_add(address + i);
 		}
 		if (g_gb_state.cache_ready) {
 			if (achievements_smart_cache_enabled() && g_gb_rtquery) {
-				if (g_gb_state.cache_reindexing) {
-					if (num_bytes <= 4) {
-						uint32_t val = ra_rtquery_read(map, address, num_bytes);
-						for (uint32_t i = 0; i < num_bytes; i++)
-							buffer[i] = (uint8_t)(val >> (i * 8));
-						return num_bytes;
-					}
-					for (uint32_t i = 0; i < num_bytes; i++) {
-						uint32_t val = ra_rtquery_read(map, address + i, 1);
-						buffer[i] = (uint8_t)val;
-					}
-					return num_bytes;
-				}
+				// List-change misalignment is handled inside ra_snes_addrlist_*
+				// (active-snapshot mapping) — no rtquery-all reindex needed.
 				int any_miss = 0;
 				for (uint32_t i = 0; i < num_bytes; i++) {
 					if (ra_snes_addrlist_contains(address + i) < 0) {
@@ -135,7 +124,7 @@ static uint32_t gameboy_read_memory(void *map, uint32_t address, uint8_t *buffer
 static int gameboy_poll(void *map, void *client, int game_loaded)
 {
 #ifdef HAS_RCHEEVOS
-	if (!client || !game_loaded || !map || !g_gb_state.optionc) return 0;
+	if (!client || !game_loaded || !map || !g_gb_state.seladdr) return 0;
 
 	rc_client_t *rc_client = (rc_client_t *)client;
 
@@ -145,6 +134,9 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 	if (achievements_smart_cache_enabled() && g_gb_rtquery) {
 
 		if (ra_snes_addrlist_count() == 0 && !g_gb_state.cache_ready) {
+			// Re-prime to WAITING before the all-zero collection frame so a
+			// mid-game re-bootstrap (stall recovery) cannot fire on zeros.
+			rc_client_reset(rc_client);
 			g_gb_state.collecting = 1;
 			ra_snes_addrlist_begin_collect();
 			rc_client_do_frame(rc_client);
@@ -161,16 +153,14 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 				g_gb_state.game_frames = 0;
 				g_gb_state.poll_logged = 0;
 				clock_gettime(CLOCK_MONOTONIC, &g_gb_state.cache_time);
-				ra_log_write("GB SmartCache: Cache active! %d addrs\n", ra_snes_addrlist_count());
+				// Discard the zero-primed bootstrap state (delta conditions
+				// would otherwise see 0 -> real transitions and fire).
+				rc_client_reset(rc_client);
+				ra_log_write("GB SmartCache: Cache active! %d addrs (rc_client reset)\n", ra_snes_addrlist_count());
 			}
 		} else {
 			uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-			optionc_resync_if_backward(&g_gb_state, resp_frame, "GameBoy");
-
-			if (g_gb_state.cache_reindexing && ra_snes_addrlist_is_ready(map)) {
-				g_gb_state.cache_reindexing = 0;
-				ra_log_write("GB SmartCache: Reindex complete (%d addrs)\n", ra_snes_addrlist_count());
-			}
+			seladdr_resync_if_backward(&g_gb_state, resp_frame, "GameBoy");
 
 			if (resp_frame > g_gb_state.last_resp_frame) {
 				g_gb_state.last_resp_frame = resp_frame;
@@ -181,9 +171,12 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 					ra_log_write("GB SmartCache: GameFrame %u (resp_frame=%u, addrs=%d)\n",
 						g_gb_state.game_frames, resp_frame, ra_snes_addrlist_count());
 
+				// Cleanup recollect only when the FPGA confirmed the current
+				// list — keeps a single revision in flight so the active
+				// snapshot stays valid for cached reads during the switch.
 				int cleanup_frame = (g_gb_state.game_frames % 600 == 0)
 					&& (g_gb_state.game_frames > 0)
-					&& !g_gb_state.cache_reindexing;
+					&& ra_snes_addrlist_is_ready(map);
 				if (cleanup_frame) {
 					g_gb_state.collecting = 1;
 					ra_snes_addrlist_begin_collect();
@@ -198,7 +191,6 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 						int new_count = ra_snes_addrlist_count();
 						ra_log_write("GB SmartCache: Cleanup — pruned %d stale (%d -> %d)\n",
 							old_count - new_count, old_count, new_count);
-						g_gb_state.cache_reindexing = 1;
 					}
 				} else {
 					if (ra_snes_addrlist_has_pending())
@@ -228,17 +220,19 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 	// ===================================================================
 
 	if (ra_snes_addrlist_count() == 0 && !g_gb_state.cache_ready) {
-		// Bootstrap: run one do_frame with zeros to discover needed addresses
+		// Bootstrap: run one do_frame with zeros to discover needed addresses.
+		// Re-prime to WAITING first (see smart-cache bootstrap).
+		rc_client_reset(rc_client);
 		g_gb_state.collecting = 1;
 		ra_snes_addrlist_begin_collect();
 		rc_client_do_frame(rc_client);
 		g_gb_state.collecting = 0;
 		int changed = ra_snes_addrlist_end_collect(map);
 		if (changed) {
-			ra_log_write("GB OptionC: Bootstrap collection done, %d addrs written to DDRAM\n",
+			ra_log_write("GB SelAddr: Bootstrap collection done, %d addrs written to DDRAM\n",
 				ra_snes_addrlist_count());
 		} else {
-			ra_log_write("GB OptionC: No addresses collected — achievements may have no memory refs\n");
+			ra_log_write("GB SelAddr: No addresses collected — achievements may have no memory refs\n");
 		}
 	} else if (!g_gb_state.cache_ready) {
 		// Wait for FPGA to respond with cached values
@@ -248,12 +242,14 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 			g_gb_state.game_frames = 0;
 			g_gb_state.poll_logged = 0;
 			clock_gettime(CLOCK_MONOTONIC, &g_gb_state.cache_time);
-			ra_log_write("GB OptionC: Cache active! FPGA response matched request.\n");
+			// Discard the zero-primed bootstrap state (see smart-cache path).
+			rc_client_reset(rc_client);
+			ra_log_write("GB SelAddr: Cache active! FPGA response matched request (rc_client reset).\n");
 		}
 	} else {
 		// Normal frame processing from cache
 		uint32_t resp_frame = ra_snes_addrlist_response_frame(map);
-		optionc_resync_if_backward(&g_gb_state, resp_frame, "GameBoy");
+		seladdr_resync_if_backward(&g_gb_state, resp_frame, "GameBoy");
 		if (resp_frame > g_gb_state.last_resp_frame) {
 			g_gb_state.last_resp_frame = resp_frame;
 			g_gb_state.game_frames++;
@@ -261,40 +257,44 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 			clock_gettime(CLOCK_MONOTONIC, &g_gb_state.stall_time);
 			g_gb_state.stall_frame = resp_frame;
 
-			// Periodically re-collect to catch address changes (every ~5 min)
-			// Smart cache mode: skip re-collect (no dynamic pointers in GameBoy)
-			int re_collect = !achievements_smart_cache_enabled()
-				&& (g_gb_state.game_frames % 18000 == 0) && (g_gb_state.game_frames > 0);
-			if (re_collect) {
-				g_gb_state.collecting = 1;
-				ra_snes_addrlist_begin_collect();
-			}
-
-			rc_client_do_frame(rc_client);
-
-			// Value-change watchers
-			for (unsigned int i = 0; i < GB_WATCHER_COUNT; i++) {
-				uint8_t cur = ra_snes_addrlist_read_cached(map, g_gb_watchers[i].addr);
-				if (!g_gb_watchers[i].initialized) {
-					g_gb_watchers[i].last_val = cur;
-					g_gb_watchers[i].initialized = 1;
-				} else if (cur != g_gb_watchers[i].last_val) {
-					ra_log_write("GB Watch[%s @ 0x%04X]: 0x%02X -> 0x%02X (frame %u)\n",
-						g_gb_watchers[i].name, g_gb_watchers[i].addr,
-						g_gb_watchers[i].last_val, cur, g_gb_state.game_frames);
-					g_gb_watchers[i].last_val = cur;
+			// Skip achievement processing while a recollect revision is in
+			// flight (newly collected addresses would read as 0).
+			if (ra_snes_addrlist_is_ready(map)) {
+				// Periodically re-collect to catch address changes (every ~5 min)
+				// Smart cache mode: skip re-collect (no dynamic pointers in GameBoy)
+				int re_collect = !achievements_smart_cache_enabled()
+					&& (g_gb_state.game_frames % 18000 == 0) && (g_gb_state.game_frames > 0);
+				if (re_collect) {
+					g_gb_state.collecting = 1;
+					ra_snes_addrlist_begin_collect();
 				}
-			}
 
-			if (re_collect) {
-				g_gb_state.collecting = 0;
-				if (ra_snes_addrlist_end_collect(map)) {
-					ra_log_write("GB OptionC: Address list refreshed, %d addrs\n",
-						ra_snes_addrlist_count());
+				rc_client_do_frame(rc_client);
+
+				// Value-change watchers
+				for (unsigned int i = 0; i < GB_WATCHER_COUNT; i++) {
+					uint8_t cur = ra_snes_addrlist_read_cached(map, g_gb_watchers[i].addr);
+					if (!g_gb_watchers[i].initialized) {
+						g_gb_watchers[i].last_val = cur;
+						g_gb_watchers[i].initialized = 1;
+					} else if (cur != g_gb_watchers[i].last_val) {
+						ra_log_write("GB Watch[%s @ 0x%04X]: 0x%02X -> 0x%02X (frame %u)\n",
+							g_gb_watchers[i].name, g_gb_watchers[i].addr,
+							g_gb_watchers[i].last_val, cur, g_gb_state.game_frames);
+						g_gb_watchers[i].last_val = cur;
+					}
+				}
+
+				if (re_collect) {
+					g_gb_state.collecting = 0;
+					if (ra_snes_addrlist_end_collect(map)) {
+						ra_log_write("GB SelAddr: Address list refreshed, %d addrs\n",
+							ra_snes_addrlist_count());
+					}
 				}
 			}
 		} else {
-			optionc_check_stall_recovery(&g_gb_state, resp_frame, "GameBoy");
+			seladdr_check_stall_recovery(&g_gb_state, resp_frame, "GameBoy");
 		}
 	}
 
@@ -339,8 +339,8 @@ static int gameboy_detect_protocol(void *map)
 		ra_log_write("Gameboy: FPGA mirror not detected -- RA support unavailable\n");
 		return 0;
 	}
-	g_gb_state.optionc = 1;
-	ra_log_write("Gameboy FPGA protocol: Option C (selective address reading)\n");
+	g_gb_state.seladdr = 1;
+	ra_log_write("Gameboy FPGA protocol: Selective Address (selective address reading)\n");
 
 	if (ra_rtquery_supported(map) && achievements_rtquery_enabled()) {
 		g_gb_rtquery = 1;

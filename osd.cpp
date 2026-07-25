@@ -40,6 +40,7 @@ as rotated copies of the first 128 entries.  -- AMR
 
 #include "osd.h"
 #include "spi.h"
+#include "achievements.h"
 
 #include "charrom.h"
 #include "logo.h"
@@ -500,6 +501,14 @@ void OsdClear(void)
 // enable displaying of OSD
 void OsdEnable(unsigned char mode)
 {
+	// Cores with autosave start streaming their save RAM the moment the OSD
+	// status bit rises. Arm the RA save-I/O guard BEFORE enabling the OSD so
+	// no achievement evaluation can race the first sectors of that transfer
+	// (the per-sector notifications then keep the guard armed for the burst).
+	// OSD_MSG windows (info/achievement popups) never raise OSD_STATUS in the
+	// core (sys/osd.v gates it on the mode bits), so they can't trigger the
+	// autosave and must not pause evaluation.
+	if (!(mode & OSD_MSG)) achievements_notify_save_io();
 	user_io_osd_key_enable(mode & DISABLE_KEYBOARD);
 	mode &= (DISABLE_KEYBOARD | OSD_MSG);
 	spi_osd_cmd(OSD_CMD_ENABLE | mode);
