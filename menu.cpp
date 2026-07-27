@@ -40,6 +40,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #include <libgen.h>
 #include <bluetooth.h>
 #include <hci.h>
@@ -233,6 +234,8 @@ static uint32_t menu_timer = 0;
 static uint32_t menu_save_timer = 0;
 static uint32_t load_addr = 0;
 static int32_t  bt_timer = 0;
+static bool     bt_present = false;
+static bool     bt_pairing = false;
 
 static bool osd_unlocked = 1;
 static char osd_code_entry[32];
@@ -1083,6 +1086,12 @@ void build_advanced_map_summary(advancedButtonMap *abm, char *dest_str, size_t d
 	snprintf(dest_str, dest_size, "%s->%s", input_str, output_str);
 }
 
+static void *close_pipe_async(void *arg)
+{
+	pclose((FILE *)arg);
+	return NULL;
+}
+
 void HandleUI(void)
 {
 	PROFILE_FUNCTION();
@@ -1100,6 +1109,16 @@ void HandleUI(void)
 				printf("*** reset bt ***\n");
 				system("/bin/bluetoothd hcireset &");
 			}
+		}
+	}
+
+	{
+		static unsigned long bt_icon_timer = 0;
+		if (!bt_pairing && (!bt_icon_timer || CheckTimer(bt_icon_timer)))
+		{
+			bt_present = (hci_get_route(0) >= 0);
+			bt_icon_timer = GetTimer(3000);
+			if (!bt_icon_timer) bt_icon_timer = 1;
 		}
 	}
 
@@ -2571,6 +2590,7 @@ void HandleUI(void)
 									if (is_3do() && !bit) p3do_reset();
 
 									user_io_status_set(opt, 1, ex);
+									if (is_n64() && !ex && !strcmp(opt, "[41]")) n64_save_dd_disk();
 									user_io_status_set(opt, 0, ex);
 
 									// Notify RA only after the reset pulse: notifying before it
@@ -6271,7 +6291,7 @@ void HandleUI(void)
 
 	case MENU_MINIMIG_CHIPSET1:
 		helptext_idx = HELPTEXT_CHIPSET;
-		menumask = 0x3FF;
+		menumask = 0x7FF;
 		OsdSetTitle("System");
 		parentstate = menustate;
 
@@ -6317,8 +6337,13 @@ void HandleUI(void)
 		strcat(s, (minimig_config.memory & 0x40) ? "enabled " : "disabled");
 		OsdWrite(m++, s, menusub == 8, 0);
 
+		OsdWrite(m++, "", 0, 0);
+		strcpy(s, " Ethernet : ");
+		strcat(s, a2065_iface_msg(a2065_get_iface()));
+		OsdWrite(m++, s, menusub == 9, 0);
+
 		for (int i = m; i < OsdGetSize() - 1; i++) OsdWrite(i, "", 0, 0);
-		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 9, 0);
+		OsdWrite(OsdGetSize() - 1, STD_BACK, menusub == 10, 0);
 
 		menustate = MENU_MINIMIG_CHIPSET2;
 		break;
@@ -6449,6 +6474,22 @@ void HandleUI(void)
 				menustate = MENU_MINIMIG_CHIPSET1;
 			}
 			else if (menusub == 9)
+			{
+				// A2065 ethernet: OFF -> eth0 -> eth1 -> macvlan -> tap0,
+				// skipping anything this box cannot support (no second NIC,
+				// no tun driver, no macvlan). OFF and eth0 always qualify, so
+				// the walk always lands somewhere.
+				int m2 = a2065_get_iface();
+				for (int i = 0; i < A2065_MODES; i++)
+				{
+					m2 = minus ? (m2 + A2065_MODES - 1) % A2065_MODES
+					           : (m2 + 1) % A2065_MODES;
+					if (a2065_mode_available(m2)) break;
+				}
+				a2065_set_iface(m2);
+				menustate = MENU_MINIMIG_CHIPSET1;
+			}
+			else if (menusub == 10)
 			{
 				menustate = MENU_MINIMIG_MAIN1;
 				menusub = 6;
@@ -7176,6 +7217,7 @@ void HandleUI(void)
 		sched_setaffinity(0, sizeof(set), &set);
 		if (parentstate == MENU_BTPAIR)
 		{
+			bt_pairing = true;
 			OsdUpdate();
 			if(cfg.bt_reset_before_pair) system("hciconfig hci0 reset");
 			script_pipe = popen("/usr/sbin/btpair", "r");
@@ -7223,9 +7265,13 @@ void HandleUI(void)
 			if (!script_finished)
 			{
 				strcpy(script_command, "killall ");
-				strcat(script_command, (parentstate == MENU_BTPAIR) ? "-SIGINT btctl" : flist_SelectedItem()->de.d_name);
+				strcat(script_command, (parentstate == MENU_BTPAIR) ? "-SIGINT btpair btctl" : flist_SelectedItem()->de.d_name);
 				system(script_command);
-				pclose(script_pipe);
+				FILE *p = script_pipe;
+				script_pipe = NULL;
+				pthread_t tid;
+				if (!pthread_create(&tid, NULL, close_pipe_async, p)) pthread_detach(tid);
+				else { printf("close_pipe_async: pthread_create failed\n"); pclose(p); }
 				cpu_set_t set;
 				CPU_ZERO(&set);
 				CPU_SET(1, &set);
@@ -7245,6 +7291,7 @@ void HandleUI(void)
 			{
 				if (parentstate == MENU_BTPAIR)
 				{
+					bt_pairing = false;
 					menustate = MENU_NONE1;
 				}
 				else
@@ -7767,7 +7814,7 @@ void HandleUI(void)
 				int n = 8;
 				if (getNet(2)) str[n++] = 0x1d;
 				if (getNet(1)) str[n++] = 0x1c;
-				if (hci_get_route(0) >= 0) str[n++] = 4;
+				if (bt_present) str[n++] = 4;
 				if (user_io_get_sdram_cfg() & 0x8000)
 				{
 					switch (user_io_get_sdram_cfg() & 7)
