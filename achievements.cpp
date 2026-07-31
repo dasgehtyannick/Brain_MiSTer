@@ -206,6 +206,8 @@ static int g_multiline_desc            = 0;  // 1 = wrap long text to extra line
 static int g_pending_reset_request     = 0;  // RC_CLIENT_EVENT_RESET received: reset the core on the next poll tick
 static int g_smart_cleanup             = 1;  // 1 = dynamic-only smart-cache prune (SNES/NES/MD): drops AddAddress targets ~1/min; statics never pruned
 static int g_justifier_test            = 0;  // 1 = MegaDrive only: cap rtquery busy-wait (~1ms + fail-fast) to A/B test lightgun input latency
+static int g_desc_ticker               = 0;  // 1 = scroll the selected achievement's description on a ticker row in the list view (retroachievements.cfg: list_desc_ticker)
+static int g_list_hotkey               = 0;  // 1 = in-game gamepad shortcut (Menu + Y) opens the achievement list (retroachievements.cfg: list_hotkey)
 
 // Debug watch list (retroachievements.cfg: watch=19807d,19795a — RA addresses
 // in hex). Handlers log every value change of these addresses per frame.
@@ -599,6 +601,10 @@ static int ra_load_credentials(void)
 			g_gba_reset_ram = atoi(val);
 		} else if (!strcasecmp(key, "multiline_desc")) {
 			g_multiline_desc = atoi(val);
+		} else if (!strcasecmp(key, "list_desc_ticker")) {
+			g_desc_ticker = atoi(val);
+		} else if (!strcasecmp(key, "list_hotkey")) {
+			g_list_hotkey = atoi(val);
 		} else if (!strcasecmp(key, "smart_cleanup")) {
 			g_smart_cleanup = atoi(val);
 		} else if (!strcasecmp(key, "justifier_test")) {
@@ -630,11 +636,11 @@ static int ra_load_credentials(void)
 	}
 
 	RA_LOG("Credentials loaded: user=%s password=***(%zu chars)", g_ra_user, strlen(g_ra_password));
-	RA_LOG("Config: show_challenge_show=%d show_challenge_hide=%d show_progress=%d show_progress_name=%d show_leaderboards_updates=%d show_leaderboards_submission=%d leaderboards_enabled(deprecated)=%d hardcore=%d force_hardcore=%d stall_recovery=%d rtquery=%d recollect=%d smart_cache=%d smart_cleanup=%d justifier_test=%d n64_snapshot=%d gba_reset_ram=%d multiline_desc=%d debug=%d",
+	RA_LOG("Config: show_challenge_show=%d show_challenge_hide=%d show_progress=%d show_progress_name=%d show_leaderboards_updates=%d show_leaderboards_submission=%d leaderboards_enabled(deprecated)=%d hardcore=%d force_hardcore=%d stall_recovery=%d rtquery=%d recollect=%d smart_cache=%d smart_cleanup=%d justifier_test=%d n64_snapshot=%d gba_reset_ram=%d multiline_desc=%d list_desc_ticker=%d list_hotkey=%d debug=%d",
                 g_show_challenge_show_popup, g_show_challenge_hide_popup,
                 g_show_progress_popups, g_show_progress_name,
 		g_show_leaderboards_updates, g_show_leaderboards_submission, g_leaderboards_enabled,
-                g_hardcore, g_force_hardcore, g_stall_recovery, g_rtquery_enabled, g_recollect_interval, g_smart_cache, g_smart_cleanup, g_justifier_test, g_n64_snapshot, g_gba_reset_ram, g_multiline_desc, g_ra_debug);
+                g_hardcore, g_force_hardcore, g_stall_recovery, g_rtquery_enabled, g_recollect_interval, g_smart_cache, g_smart_cleanup, g_justifier_test, g_n64_snapshot, g_gba_reset_ram, g_multiline_desc, g_desc_ticker, g_list_hotkey, g_ra_debug);
 	return 1;
 }
 
@@ -643,24 +649,20 @@ static int ra_load_credentials(void)
 // Text formatting helper: truncate with "..." or wrap to multiple lines
 // ---------------------------------------------------------------------------
 
-static void ra_format_text(const char *text, char *out, size_t out_size, int trunc_width, int wrap_width, int max_lines)
+// Word-wrap `text` into `out` as a '\n'-separated string of at most
+// `max_lines` lines, each up to `wrap_width` characters. Breaks on spaces
+// when possible; a word longer than the line hard-breaks. If the text does
+// not fit, the last line ends with "...". Unlike ra_format_text this always
+// wraps, regardless of the multiline_desc option (used by the detail view).
+static void ra_wrap_text(const char *text, char *out, size_t out_size, int wrap_width, int max_lines)
 {
 	if (!text || !out || out_size == 0) return;
 	size_t len = strlen(text);
-	if (!g_multiline_desc) {
-		if (len <= (size_t)trunc_width) {
-			snprintf(out, out_size, "%s", text);
-			return;
-		}
-		size_t copy = (size_t)trunc_width < out_size - 1 ? (size_t)trunc_width : out_size - 1;
-		memcpy(out, text, copy);
-		out[copy] = '\0';
-		if (copy + 3 < out_size) strcat(out, "...");
-	} else {
-		if (len <= (size_t)wrap_width) {
-			snprintf(out, out_size, "%s", text);
-			return;
-		}
+	if (len <= (size_t)wrap_width) {
+		snprintf(out, out_size, "%s", text);
+		return;
+	}
+	{
 		size_t pos = 0, written = 0;
 		for (int line = 0; line < max_lines && pos < len && written + 1 < out_size; line++) {
 			if (line > 0) { out[written++] = '\n'; out[written] = '\0'; }
@@ -704,6 +706,27 @@ static void ra_format_text(const char *text, char *out, size_t out_size, int tru
 			}
 			strcat(out, "...");
 		}
+	}
+}
+
+// Format an achievement title/description for a popup line. With multiline_desc
+// off, long text is truncated to trunc_width with a trailing "..."; with it on,
+// the text is word-wrapped over up to max_lines lines of wrap_width columns.
+static void ra_format_text(const char *text, char *out, size_t out_size, int trunc_width, int wrap_width, int max_lines)
+{
+	if (!text || !out || out_size == 0) return;
+	size_t len = strlen(text);
+	if (!g_multiline_desc) {
+		if (len <= (size_t)trunc_width) {
+			snprintf(out, out_size, "%s", text);
+			return;
+		}
+		size_t copy = (size_t)trunc_width < out_size - 1 ? (size_t)trunc_width : out_size - 1;
+		memcpy(out, text, copy);
+		out[copy] = '\0';
+		if (copy + 3 < out_size) strcat(out, "...");
+	} else {
+		ra_wrap_text(text, out, out_size, wrap_width, max_lines);
 	}
 }
 
@@ -2040,12 +2063,13 @@ int achievements_smart_cache_enabled(void)
 
 #ifdef HAS_RCHEEVOS
 	int cid = ra_get_console_id();
-	// All Selective Address cores except SMS now support the RTQuery mailbox
-	// (SMS is Legacy-only: no FPGA-side realtime-query support yet).
+	// All Selective Address cores now support the RTQuery mailbox (SMS/Game
+	// Gear gained FPGA-side realtime-query support, ra_ram_mirror_sms v0x02).
 	if (cid == RC_CONSOLE_PLAYSTATION || cid == RC_CONSOLE_NINTENDO || cid == RC_CONSOLE_MEGA_DRIVE ||
 	    cid == RC_CONSOLE_SUPER_NINTENDO || cid == RC_CONSOLE_GAMEBOY_ADVANCE ||
 	    cid == RC_CONSOLE_GAMEBOY || cid == RC_CONSOLE_GAMEBOY_COLOR ||
 	    cid == RC_CONSOLE_SEGA_CD || cid == RC_CONSOLE_SEGA_32X ||
+	    cid == RC_CONSOLE_MASTER_SYSTEM || cid == RC_CONSOLE_GAME_GEAR ||
 	    cid == RC_CONSOLE_PC_ENGINE || cid == RC_CONSOLE_PC_ENGINE_CD ||
 	    cid == RC_CONSOLE_ARCADE || cid == RC_CONSOLE_NEO_GEO_CD) {
 		return 1;
@@ -2189,14 +2213,29 @@ static int ra_ach_view_num_sets(void)
 	return 1;
 }
 
-// OSD rows available for list items; the set-selector footer takes the
-// last row when the game has more than one set.
+// OSD rows available for list items. The set-selector footer takes one row
+// when the game has more than one set; the description ticker takes the
+// bottom row when the ticker option is enabled.
 static int ra_ach_view_rows(void)
 {
 	int rows = OsdGetSize();
 	if (ra_ach_view_num_sets() > 1) rows--;
+	if (g_desc_ticker) rows--;
 	return rows;
 }
+
+#ifdef HAS_RCHEEVOS
+// The achievement highlighted in the list view, or nullptr when the current
+// row is a section header / progress sub-line or the list is not built.
+static const rc_client_achievement_t *ra_list_selected_ach(void)
+{
+	int idx = g_ach_view_selected;
+	if (!g_ach_view_items || idx < 0 || idx >= g_ach_view_total) return nullptr;
+	const AchViewItem &it = g_ach_view_items[idx];
+	if (it.is_header || it.is_subline || !it.ach) return nullptr;
+	return it.ach;
+}
+#endif
 
 int achievements_has_active_game(void)
 {
@@ -2516,5 +2555,112 @@ void achievements_list_print(void)
 			(set && set->title) ? set->title : "");
 		OsdWriteOffset(osd_size, s, 0, 0, 0, 0);
 	}
+
+	// Description ticker (retroachievements.cfg: list_desc_ticker). Draw the
+	// static first line here; achievements_list_ticker() animates it across the
+	// bottom row each UI tick when the text is longer than the row.
+	if (g_desc_ticker) {
+		const rc_client_achievement_t *ach = ra_list_selected_ach();
+		const char *desc = ach ? ach->description : "";
+		s[0] = ' ';
+		strncpy(s + 1, desc, 30);
+		s[31] = 0;
+		OsdWriteOffset(OsdGetSize() - 1, s, 0, 0, 0, 0);
+		ScrollReset(0);
+	}
+#endif
+}
+
+// Animate the description ticker across the bottom row of the list view. Call
+// once per UI tick while the list is shown (no-op unless the ticker option is
+// enabled). Mirrors cheats_scroll_name()/recent_scroll_name().
+void achievements_list_ticker(void)
+{
+#ifdef HAS_RCHEEVOS
+	if (!g_desc_ticker) return;
+	const rc_client_achievement_t *ach = ra_list_selected_ach();
+	const char *desc = ach ? ach->description : "";
+	char name[512];
+	name[0] = ' ';
+	snprintf(name + 1, sizeof(name) - 1, "%s", desc);
+	// idx 0 = list scroller slot (unused elsewhere in this view); off 1 keeps
+	// the leading space fixed while the text scrolls underneath it.
+	ScrollText(OsdGetSize() - 1, name, 1, 0, 30, 0, 0);
+#endif
+}
+
+// 1 if the row highlighted in the list view is a real achievement (not a
+// section header or progress sub-line). Gates the detail screen.
+int achievements_list_selected_is_ach(void)
+{
+#ifdef HAS_RCHEEVOS
+	return ra_list_selected_ach() != nullptr;
+#else
+	return 0;
+#endif
+}
+
+int achievements_desc_ticker_enabled(void) { return g_desc_ticker; }
+int achievements_list_hotkey_enabled(void) { return g_list_hotkey; }
+
+#ifdef HAS_RCHEEVOS
+// Write a '\n'-separated wrapped string to consecutive OSD rows starting at
+// `row`, each prefixed with a leading space. Returns the next free row.
+static int ra_osd_write_wrapped(int row, const char *wrapped, int invert)
+{
+	const char *p = wrapped;
+	while (*p && row < OsdGetSize()) {
+		char line[40];
+		const char *nl = strchr(p, '\n');
+		size_t n = nl ? (size_t)(nl - p) : strlen(p);
+		if (n > sizeof(line) - 2) n = sizeof(line) - 2;
+		line[0] = ' ';
+		memcpy(line + 1, p, n);
+		line[n + 1] = 0;
+		OsdWrite(row++, line, invert, 0);
+		if (!nl) break;
+		p = nl + 1;
+	}
+	return row;
+}
+#endif
+
+// Render the full-screen detail view (title, points/state, progress and the
+// word-wrapped description) of the achievement highlighted in the list.
+void achievements_detail_print(void)
+{
+#ifdef HAS_RCHEEVOS
+	const rc_client_achievement_t *ach = ra_list_selected_ach();
+	int size = OsdGetSize();
+	for (int i = 0; i < size; i++) OsdWrite(i, "", 0, 0);
+	if (!ach) return;
+
+	bool unlocked = (ach->state == RC_CLIENT_ACHIEVEMENT_STATE_UNLOCKED);
+
+	// Title (always wrapped, up to 2 lines, highlighted)
+	char title_wrap[96];
+	ra_wrap_text(ach->title, title_wrap, sizeof(title_wrap), 28, 2);
+	int row = ra_osd_write_wrapped(0, title_wrap, 1);
+
+	// Points + state
+	char meta[40];
+	snprintf(meta, sizeof(meta), " %s%c %u pts",
+		unlocked ? "Unlocked " : "Locked ", unlocked ? 0x1a : 0x1b, ach->points);
+	OsdWrite(row++, meta, 0, 0);
+
+	if (ach->measured_progress[0]) {
+		char prog[40];
+		snprintf(prog, sizeof(prog), " Progress: %.27s", ach->measured_progress);
+		OsdWrite(row++, prog, 0, 0);
+	}
+
+	OsdWrite(row++, "", 0, 0);
+
+	// Description over the remaining rows
+	int maxlines = size - row;
+	if (maxlines < 1) maxlines = 1;
+	char desc_wrap[512];
+	ra_wrap_text(ach->description, desc_wrap, sizeof(desc_wrap), 28, maxlines);
+	ra_osd_write_wrapped(row, desc_wrap, 0);
 #endif
 }
