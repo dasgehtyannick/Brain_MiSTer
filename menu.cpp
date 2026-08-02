@@ -141,6 +141,8 @@ enum MENU
 
 	MENU_RA_ACHIEVEMENTS1,
 	MENU_RA_ACHIEVEMENTS2,
+	MENU_RA_ACH_DETAIL1,
+	MENU_RA_ACH_DETAIL2,
 
 	MENU_UART1,
 	MENU_UART2,
@@ -1137,6 +1139,9 @@ void HandleUI(void)
 	static int flash_state = 0;
 	static uint32_t dip_submenu;
 	static uint32_t manual_submenu;
+	static uint32_t ra_submenu;              // generic-menu row of the "Achievements" entry (-1 when absent)
+	static int ra_list_ret = MENU_NONE1;     // menustate to return to when the achievement list/detail closes
+	static uint32_t ra_list_ret_sub = 0;     // menusub to restore on that return
 	static int need_reset = 0;
 	static int flat = 0;
 	static int menusub_parent = 0;
@@ -1324,6 +1329,8 @@ void HandleUI(void)
 				int ach_count = achievements_list_open();
 				if (ach_count > 0)
 				{
+					ra_list_ret = MENU_NONE1;   // F6/in-game shortcut closes back to the game
+					ra_list_ret_sub = 0;
 					OsdSetSize(16);
 					menusub = 0;
 					OsdClear();
@@ -1900,6 +1907,7 @@ void HandleUI(void)
 
 			dip_submenu = -1;
 			manual_submenu = -1;
+			ra_submenu = -1;
 
 			int last_space = 0;
 
@@ -2179,6 +2187,17 @@ void HandleUI(void)
 				}
 			} while (p);
 
+			// RetroAchievements list entry, appended after the core's own options
+			// (main page only) so it never shifts the confstr-derived indices.
+			if (!page && achievements_has_active_game())
+			{
+				ra_submenu = selentry;
+				MenuWrite(entry, " Achievements", menusub == selentry, 0);
+				menumask = (menumask << 1) | 1;
+				entry++;
+				selentry++;
+			}
+
 			if (!entry) break;
 
 			for (; entry < OsdGetSize() - 1; entry++) MenuWrite(entry, "", 0, 0);
@@ -2281,6 +2300,21 @@ void HandleUI(void)
 				page = 0;
 			}
 		}
+		else if (c == KEY_TAB && achievements_has_active_game())
+		{
+			// Quick shortcut: Y (mapped to TAB in the OSD) opens the list.
+			int ach_count = achievements_list_open();
+			if (ach_count > 0)
+			{
+				ra_list_ret = MENU_GENERIC_MAIN1;
+				ra_list_ret_sub = menusub;
+				OsdSetSize(16);
+				menusub = 0;
+				OsdClear();
+				OsdEnable(DISABLE_KEYBOARD);
+				menustate = MENU_RA_ACHIEVEMENTS1;
+			}
+		}
 		else if (select || recent || minus || plus || !mgl->done)
 		{
 			if (!mgl->done)
@@ -2289,7 +2323,22 @@ void HandleUI(void)
 				select = 1;
 			}
 
-			if (manual_submenu == menusub)
+			if (ra_submenu == menusub && select)
+			{
+				// "Achievements" menu entry: open the list view.
+				int ach_count = achievements_list_open();
+				if (ach_count > 0)
+				{
+					ra_list_ret = MENU_GENERIC_MAIN1;
+					ra_list_ret_sub = menusub;
+					OsdSetSize(16);
+					menusub = 0;
+					OsdClear();
+					OsdEnable(DISABLE_KEYBOARD);
+					menustate = MENU_RA_ACHIEVEMENTS1;
+				}
+			}
+			else if (manual_submenu == menusub)
 			{
 				if (select)
 				{
@@ -5646,10 +5695,20 @@ void HandleUI(void)
 	case MENU_RA_ACHIEVEMENTS2:
 		menumask = 0;
 
-		if (menu)
+		achievements_list_ticker(); // animate the description ticker (no-op unless enabled)
+
+		if (menu || back)
 		{
 			achievements_list_close();
-			menustate = MENU_NONE1;
+			menustate = ra_list_ret;
+			menusub = ra_list_ret_sub;
+			break;
+		}
+
+		// A (select) or Y (TAB) opens the detail screen of the highlighted item.
+		if ((select || c == KEY_TAB) && achievements_list_selected_is_ach())
+		{
+			menustate = MENU_RA_ACH_DETAIL1;
 			break;
 		}
 
@@ -5700,6 +5759,25 @@ void HandleUI(void)
 		if (up)
 		{
 			achievements_list_scan(SCANF_PREV);
+			menustate = MENU_RA_ACHIEVEMENTS1;
+		}
+		break;
+
+		/******************************************************************/
+		/* RetroAchievements detail (description of the selected entry)    */
+		/******************************************************************/
+	case MENU_RA_ACH_DETAIL1:
+		OsdSetTitle("Achievement");
+		achievements_detail_print();
+		menustate = MENU_RA_ACH_DETAIL2;
+		parentstate = menustate;
+		break;
+
+	case MENU_RA_ACH_DETAIL2:
+		menumask = 0;
+		// Back (B) or Menu returns to the list, selection preserved.
+		if (menu || back)
+		{
 			menustate = MENU_RA_ACHIEVEMENTS1;
 		}
 		break;

@@ -70,6 +70,24 @@ void achievements_list_scan(int mode);
 // Render the current page of the achievement list to the OSD.
 void achievements_list_print(void);
 
+// Animate the description ticker across the list view's bottom row. Call once
+// per UI tick while the list is shown (no-op unless list_desc_ticker is set).
+void achievements_list_ticker(void);
+
+// 1 if the row highlighted in the list view is a real achievement (not a
+// section header or progress sub-line). Gates the detail screen.
+int achievements_list_selected_is_ach(void);
+
+// Render the full-screen detail view (title, points/state, progress and the
+// word-wrapped description) of the achievement highlighted in the list.
+void achievements_detail_print(void);
+
+// 1 = description ticker enabled in the list view (retroachievements.cfg: list_desc_ticker)
+int achievements_desc_ticker_enabled(void);
+
+// 1 = in-game Menu+Y gamepad shortcut to the list enabled (retroachievements.cfg: list_hotkey)
+int achievements_list_hotkey_enabled(void);
+
 // Returns the total count in the currently open list (0 if not open).
 int achievements_list_count(void);
 
