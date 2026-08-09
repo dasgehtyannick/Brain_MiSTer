@@ -8,22 +8,22 @@ This is a fork of the official [MiSTer Main binary](https://github.com/MiSTer-de
 
 | Core | Console ID | Hardcore | Modified Core Repo |
 |------|-----------|----------|--------------------|
-| NES | 7 | ✅ enforced | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
-| Famicom Disk System (via NES core) | 81 | ✅ enforced | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
-| SNES (incl. SA-1 / SuperFX) | 3 | ✅ enforced | [odelot/SNES_MiSTer](https://github.com/odelot/SNES_MiSTer) |
-| Genesis / Mega Drive | 1 | ✅ enforced | [odelot/MegaDrive_MiSTer](https://github.com/odelot/MegaDrive_MiSTer) |
-| N64 | 2 | ✅ enforced | [odelot/N64_MiSTer](https://github.com/odelot/N64_MiSTer) |
-| PSX | 12 | ✅ enforced | [odelot/PSX_MiSTer](https://github.com/odelot/PSX_MiSTer) |
+| NES | 7 | ✅ Officially Supported | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
+| Famicom Disk System (via NES core) | 81 | ✅ Officially Supported | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
+| SNES (incl. SA-1 / SuperFX) | 3 | ✅ Officially Supported | [odelot/SNES_MiSTer](https://github.com/odelot/SNES_MiSTer) |
+| Genesis / Mega Drive | 1 | ✅ Officially Supported | [odelot/MegaDrive_MiSTer](https://github.com/odelot/MegaDrive_MiSTer) |
+| N64 | 2 | ✅ Officially Supported | [odelot/N64_MiSTer](https://github.com/odelot/N64_MiSTer) |
+| PSX | 12 | ✅ Officially Supported | [odelot/PSX_MiSTer](https://github.com/odelot/PSX_MiSTer) |
 | Master System / Game Gear | 11 / 15 | 🔧 wired, in validation | [odelot/SMS_MiSTer](https://github.com/odelot/SMS_MiSTer) |
 | Gameboy / Gameboy Color | 4 / 6 | 🔧 wired, in validation | [odelot/Gameboy_MiSTer](https://github.com/odelot/Gameboy_MiSTer) |
 | GBA (Game Boy Advance) | 5 | 🔧 wired, in validation | [odelot/GBA_MiSTer](https://github.com/odelot/GBA_MiSTer) |
 | Mega CD / Sega CD | 9 | 🔧 wired, in validation | [odelot/MegaCD_MiSTer](https://github.com/odelot/MegaCD_MiSTer) |
 | TurboGrafx-16 / PC Engine (incl. CD) | 8 / 76 | 🔧 wired, in validation | [odelot/TurboGrafx16_MiSTer](https://github.com/odelot/TurboGrafx16_MiSTer) |
 | Sega 32X | 10 | 🔧 wired, in validation | [odelot/S32X_MiSTer](https://github.com/odelot/S32X_MiSTer) |
-| NeoGeo (MVS / AES / CD) | 27 / 56 | — softcore only | [odelot/NeoGeo_MiSTer](https://github.com/odelot/NeoGeo_MiSTer) |
-| Atari 2600 (via Atari7800 core) | 25 | — softcore only | [odelot/Atari7800_MiSTer](https://github.com/odelot/Atari7800_MiSTer) |
-| Atari 7800 (via Atari7800 core, `.a78`) | 51 | — softcore only | [odelot/Atari7800_MiSTer](https://github.com/odelot/Atari7800_MiSTer) |
-| Sega Saturn | 39 | — softcore only | [odelot/Saturn_MiSTer](https://github.com/odelot/Saturn_MiSTer) |
+| NeoGeo (MVS / AES / CD) | 27 / 56 | — casual only | [odelot/NeoGeo_MiSTer](https://github.com/odelot/NeoGeo_MiSTer) |
+| Atari 2600 (via Atari7800 core) | 25 | — casual only | [odelot/Atari7800_MiSTer](https://github.com/odelot/Atari7800_MiSTer) |
+| Atari 7800 (via Atari7800 core, `.a78`) | 51 | — casual only | [odelot/Atari7800_MiSTer](https://github.com/odelot/Atari7800_MiSTer) |
+| Sega Saturn | 39 | — casual only | [odelot/Saturn_MiSTer](https://github.com/odelot/Saturn_MiSTer) |
 
 See [Hardcore Mode](#hardcore-mode) for what each status means.
 
@@ -131,15 +131,15 @@ Navigation inside the list:
 
 ## Hardcore Mode
 
-Achievements run in **softcore mode** by default. Set `hardcore=1` in `retroachievements.cfg` to request hardcore mode.
+Achievements run in **casual mode** by default. Set `hardcore=1` in `retroachievements.cfg` to request hardcore mode.
 
-Hardcore is only actually engaged on cores that enforce the restrictions **in hardware** (`hardcore_protected` in the console handler). On those cores, `set_hardcore()` writes FPGA status bits that disable cheats and block savestate restore at the core level — the OSD options are hidden/ignored while hardcore is active. Cores that haven't completed hardware validation are automatically forced back to softcore.
+Hardcore is only actually engaged on cores that enforce the restrictions **in hardware** (`hardcore_protected` in the console handler). On those cores, `set_hardcore()` writes FPGA status bits that disable cheats and block savestate restore at the core level — the OSD options are hidden/ignored while hardcore is active. Cores that haven't completed hardware validation are automatically forced back to casual.
 
 | Status | Cores | Meaning |
 |--------|-------|---------|
-| ✅ **Enforced** | NES, FDS, SNES, Genesis/MD, N64, PSX | FPGA guardrails validated; `hardcore=1` engages real hardcore (cheats disabled, restore-state blocked in hardware) |
-| 🔧 **Wired, in validation** | SMS/GG, GB/GBC, GBA, MegaCD, TG16, 32X | The core RTL has the hardcore guardrails and Main maps the status bits, but the homologation checklist isn't complete — these cores still run softcore unless you set `force_hardcore=1` (for testing at your own risk) |
-| — **Softcore only** | NeoGeo, Atari 2600/7800, Saturn | No hardcore bits wired (2600/7800/Saturn cores have no cheat engine / savestates to block; NeoGeo pending) |
+| ✅ **Officially Supported** | NES, FDS, SNES, Genesis/MD, N64, PSX | FPGA guardrails validated; `hardcore=1` engages real hardcore (cheats disabled, restore-state blocked in hardware) |
+| 🔧 **Wired, in validation** | SMS/GG, GB/GBC, GBA, MegaCD, TG16, 32X | The core RTL has the hardcore guardrails and Main maps the status bits, but the homologation checklist isn't complete — these cores still run casual unless you set `force_hardcore=1` (for testing at your own risk) |
+| — **casual only** | NeoGeo, Atari 2600/7800, Saturn | No hardcore bits wired (2600/7800/Saturn cores have no cheat engine / savestates to block; NeoGeo pending) |
 
 Per-core enforcement details (status bits written by Main):
 
