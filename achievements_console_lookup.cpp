@@ -19,6 +19,7 @@ extern const console_handler_t g_console_atari2600;
 extern const console_handler_t g_console_tgfx16;
 extern const console_handler_t g_console_s32x;
 extern const console_handler_t g_console_saturn;
+extern const console_handler_t g_console_virtualboy;
 
 // Master lookup table
 static const console_handler_t *g_console_handlers[] = {
@@ -36,6 +37,7 @@ static const console_handler_t *g_console_handlers[] = {
 	&g_console_tgfx16,
 	&g_console_s32x,
 	&g_console_saturn,
+	&g_console_virtualboy,
 	NULL
 };
 
@@ -143,6 +145,38 @@ int seladdr_resync_if_backward(console_state_t *state, uint32_t resp_frame,
                 clock_gettime(CLOCK_MONOTONIC, &state->stall_time);
                 state->stall_frame = resp_frame;
                 return 1;
+        }
+        return 0;
+}
+
+// Shared gate for evaluating a frame in the smart-cache path.
+//
+// A response whose id does not match the current request_id means the FPGA's
+// scan raced a list publish, so its VALCACHE can hold values from two
+// different orderings. Indexing that with the active snapshot returns
+// neighbouring addresses' bytes for the whole frame — delta real, mem garbage
+// — which is what produced James Pond 3's burst of false unlocks. The frame's
+// correct data no longer exists, so the choice is evaluating garbage or
+// skipping one delta tick: we skip.
+//
+// The legacy paths always had this gate; only the smart-cache paths lacked it.
+// With the publish-side guards in ra_snes_addrlist_flush_dynamic/prune_dynamic
+// (busy check + freshness window) this should never fire — a hit in the log
+// means a publish slipped past them and is worth investigating. Note that
+// ra_snes_addrlist_end_collect (periodic recollect on GB/NeoGeo/PSX) has no
+// such guard yet, so those cores are the likeliest to surface one.
+int seladdr_frame_evaluable(void *map, const char *console_name)
+{
+        if (ra_snes_addrlist_is_ready(map)) return 1;
+
+        // Rate-limited: loud for the first few, then a periodic heartbeat, so a
+        // persistent problem is visible without flooding the log at 60/s.
+        static uint32_t skipped = 0;
+        skipped++;
+        if (skipped <= 10 || (skipped % 300) == 0) {
+                ra_log_write("%s SelAddr: SKIP eval frame (resp id not aligned to req_id=%u, addrs=%d, total skipped=%u)\n",
+                        console_name, ra_snes_addrlist_request_id(),
+                        ra_snes_addrlist_count(), skipped);
         }
         return 0;
 }

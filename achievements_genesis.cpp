@@ -143,7 +143,10 @@ static int genesis_poll(void *map, void *client, int game_loaded)
 					ra_log_write("MD SmartCache: GameFrame %u (resp_frame=%u, addrs=%d)\n",
 						g_md_state.game_frames, resp_frame, ra_snes_addrlist_count());
 
-				rc_client_do_frame(rc_client);
+				// Evaluate only frames whose VALCACHE ordering is confirmed
+				// (see seladdr_frame_evaluable).
+				if (seladdr_frame_evaluable(map, "Genesis"))
+					rc_client_do_frame(rc_client);
 
 				// Dynamic-only prune (~1/min, only if dynamics piled up):
 				// static bootstrap addresses stay; still-needed dynamics

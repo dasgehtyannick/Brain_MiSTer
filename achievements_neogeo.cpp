@@ -198,7 +198,9 @@ static int neogeo_poll(void *map, void *client, int game_loaded)
 					ra_snes_addrlist_begin_collect();
 				}
 
-				rc_client_do_frame(rc_client);
+				// Skip frames whose VALCACHE ordering is unconfirmed (see helper).
+				if (seladdr_frame_evaluable(map, "NeoGeo"))
+					rc_client_do_frame(rc_client);
 
 				if (cleanup_frame) {
 					g_neogeo_state.collecting = 0;

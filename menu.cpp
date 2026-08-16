@@ -8170,6 +8170,34 @@ void Info(const char *message, int timeout, int width, int height, int frame)
 	}
 }
 
+// Horizontal span the core uses for the info window: sys/osd.v samples the
+// active line in 512 steps, so the x passed to InfoEnable() runs 0..511 while
+// the window itself is <width> characters * 8 steps wide. Left and right keep
+// the same margin the classic top-left popup has always used.
+#define INFO_SPAN   512
+#define INFO_MARGIN 20
+
+void InfoAligned(const char *message, int timeout, int align, int frame)
+{
+	if (menustate <= MENU_INFO)
+	{
+		int width = 0, height = 0;
+		OSD_PrintInfo(message, &width, &height, frame);
+
+		int x = INFO_MARGIN;
+		if (align == INFO_ALIGN_CENTER) x = (INFO_SPAN - (width * 8)) / 2;
+		else if (align == INFO_ALIGN_RIGHT) x = INFO_SPAN - (width * 8) - INFO_MARGIN;
+		if (x < 0) x = 0;
+
+		InfoEnable(x, (cfg.direct_video && get_vga_fb()) ? 30 : 10, width, height);
+		OsdSetSize(16);
+
+		menu_timer = GetTimer(timeout);
+		menustate = MENU_INFO;
+		OsdUpdate();
+	}
+}
+
 void InfoAt(const char *message, int timeout, int y_pos, int frame)
 {
 	if (menustate <= MENU_INFO)

@@ -161,7 +161,9 @@ static int nes_poll(void *map, void *client, int game_loaded)
 						g_nes_state.game_frames, resp_frame, ra_snes_addrlist_count());
 				}
 
-				rc_client_do_frame(rc_client);
+				// Skip frames whose VALCACHE ordering is unconfirmed (see helper).
+				if (seladdr_frame_evaluable(map, "NES"))
+					rc_client_do_frame(rc_client);
 
 				// Dynamic-only prune (~1/min, only if dynamics piled up):
 				// static bootstrap addresses stay; still-needed dynamics
