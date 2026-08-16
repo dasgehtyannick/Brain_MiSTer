@@ -78,6 +78,7 @@ extern const console_handler_t g_console_atari7800; // not in lookup table: swit
 extern const console_handler_t g_console_saturn;
 extern const console_handler_t g_console_tgfx16;
 extern const console_handler_t g_console_s32x;
+extern const console_handler_t g_console_virtualboy;
 
 // Get console handler by core name (returns NULL if not found)
 const console_handler_t *get_console_handler_by_name(const char *core_name);
@@ -104,6 +105,14 @@ int seladdr_check_stall_recovery(console_state_t *state, uint32_t resp_frame,
 // Returns 1 if a resync happened.
 int seladdr_resync_if_backward(console_state_t *state, uint32_t resp_frame,
                                 const char *console_name);
+
+// Shared smart-cache frame gate. Call around rc_client_do_frame() in the
+// smart-cache path (the legacy paths already gate on is_ready directly):
+//   if (seladdr_frame_evaluable(map, "Genesis")) rc_client_do_frame(client);
+// Returns 1 when the VALCACHE ordering is confirmed for the current list
+// revision, 0 (rate-limited log) when this response raced a list publish and
+// its values may mix two orderings.
+int seladdr_frame_evaluable(void *map, const char *console_name);
 
 // GBA: dump valcache when an achievement triggers (call from event handler)
 void gba_dump_trigger(uint32_t ach_id);

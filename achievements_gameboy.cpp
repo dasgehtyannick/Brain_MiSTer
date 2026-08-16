@@ -182,7 +182,9 @@ static int gameboy_poll(void *map, void *client, int game_loaded)
 					ra_snes_addrlist_begin_collect();
 				}
 
-				rc_client_do_frame(rc_client);
+				// Skip frames whose VALCACHE ordering is unconfirmed (see helper).
+				if (seladdr_frame_evaluable(map, "GameBoy"))
+					rc_client_do_frame(rc_client);
 
 				if (cleanup_frame) {
 					g_gb_state.collecting = 0;

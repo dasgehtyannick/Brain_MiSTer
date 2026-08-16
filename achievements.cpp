@@ -46,44 +46,166 @@
 
 static FILE *g_logfile = NULL;
 static int g_ra_debug = 0; // forward decl — defined/loaded in ra_load_credentials
+static int g_async_log = 1; // retroachievements.cfg: async_log (1 = writer thread)
 
 #define RA_LOG(fmt, ...) ra_log_impl("RA: " fmt "\n", ##__VA_ARGS__)
+
+// ---------------------------------------------------------------------------
+// Async log writer
+//
+// Synchronous logging costs a vprintf to stdout (often a slow serial console)
+// plus a vfprintf + fflush per line, on the calling thread. Bulk diagnostics
+// pay that per address: the PROGRESS valcache dump emits up to ~1000 lines
+// inside rc_client_do_frame(), which measured ~30ms — enough to miss two
+// emulated frames. The unlock path (curl, aplay, OSD) is already off the main
+// loop; this puts logging there too.
+//
+// Producers (main loop + HTTP worker) only format into a stack buffer and
+// memcpy it into a ring slot; the writer thread does all I/O and flushes once
+// per drained batch instead of once per line. A full ring drops lines and
+// counts them rather than blocking a producer — never stall the main loop for
+// a debug feature.
+// ---------------------------------------------------------------------------
+
+// Slot width must clear the longest line actually emitted, otherwise the
+// trailing '\n' is what gets cut and the next line is appended to the
+// truncated one, corrupting the log format. Measured worst case is the
+// HTTP_WORKER curl command (~360 chars) and the Config summary (~280).
+// Bytes are untouched pages until used, so the ceiling is cheap.
+#define RA_LOGQ_SLOTS 4096
+#define RA_LOGQ_LINE  512
+
+static char     s_logq[RA_LOGQ_SLOTS][RA_LOGQ_LINE];
+static unsigned s_logq_head = 0;   // next write slot (producers)
+static unsigned s_logq_tail = 0;   // next read slot (writer)
+static unsigned s_logq_dropped = 0;
+static pthread_mutex_t s_logq_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_logq_cond  = PTHREAD_COND_INITIALIZER;
+static pthread_t s_logq_thread;
+static int s_logq_running = 0;
+static int s_logq_quit = 0;
+
+// Write one line to both sinks. Caller owns flushing.
+static void ra_log_sink(const char *line)
+{
+	printf("\033[1;35m%s\033[0m", line);
+	if (g_logfile) fputs(line, g_logfile);
+}
+
+static void *ra_log_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		char line[RA_LOGQ_LINE];
+		unsigned dropped = 0;
+		int have = 0;
+
+		pthread_mutex_lock(&s_logq_mutex);
+		while (s_logq_head == s_logq_tail && !s_logq_quit)
+			pthread_cond_wait(&s_logq_cond, &s_logq_mutex);
+		if (s_logq_head != s_logq_tail) {
+			const char *slot = s_logq[s_logq_tail % RA_LOGQ_SLOTS];
+			size_t len = strnlen(slot, RA_LOGQ_LINE - 1);
+			memcpy(line, slot, len);
+			line[len] = '\0';
+			s_logq_tail++;
+			have = 1;
+		} else if (s_logq_quit) {
+			pthread_mutex_unlock(&s_logq_mutex);
+			break;
+		}
+		// Report drops from the writer side so producers stay allocation- and
+		// I/O-free even when the ring overflows.
+		if (s_logq_dropped && s_logq_head == s_logq_tail) {
+			dropped = s_logq_dropped;
+			s_logq_dropped = 0;
+		}
+		pthread_mutex_unlock(&s_logq_mutex);
+
+		if (have) ra_log_sink(line);
+		if (dropped) {
+			char note[96];
+			snprintf(note, sizeof(note),
+				"RA: LOG: %u line(s) dropped (async queue full)\n", dropped);
+			ra_log_sink(note);
+		}
+		// Flush only when the batch is exhausted: a burst of N lines costs one
+		// fflush instead of N.
+		pthread_mutex_lock(&s_logq_mutex);
+		int drained = (s_logq_head == s_logq_tail);
+		pthread_mutex_unlock(&s_logq_mutex);
+		if (drained && g_logfile) fflush(g_logfile);
+	}
+	if (g_logfile) fflush(g_logfile);
+	return NULL;
+}
+
+// Format + hand off. Falls back to a synchronous write when the writer is not
+// running (toggle off, before startup, or after shutdown) so no line is lost.
+static void ra_log_emit(const char *fmt, va_list args)
+{
+	char line[RA_LOGQ_LINE];
+	int n = vsnprintf(line, sizeof(line), fmt, args);
+	if (n < 0) return;
+
+	// Over-long line: vsnprintf dropped the tail including the newline. Mark
+	// the cut and restore the terminator so the next line still starts fresh.
+	size_t len = (size_t)n;
+	if (n >= (int)sizeof(line)) {
+		memcpy(line + sizeof(line) - 5, "...\n", 5);
+		len = sizeof(line) - 1;
+	}
+
+	if (!s_logq_running) {
+		ra_log_sink(line);
+		if (g_logfile) fflush(g_logfile);
+		return;
+	}
+
+	pthread_mutex_lock(&s_logq_mutex);
+	if (s_logq_head - s_logq_tail >= RA_LOGQ_SLOTS) {
+		s_logq_dropped++;               // ring full: drop, never block
+	} else {
+		// Copy only the bytes in use (+NUL), not the whole slot: a bulk dump
+		// of ~800 short lines would otherwise memcpy 400KB per frame just to
+		// move ~30KB of text. Slots stay NUL-terminated, so leftover bytes
+		// from a previous longer line are never read.
+		memcpy(s_logq[s_logq_head % RA_LOGQ_SLOTS], line, len + 1);
+		s_logq_head++;
+		pthread_cond_signal(&s_logq_cond);
+	}
+	pthread_mutex_unlock(&s_logq_mutex);
+}
 
 void ra_log_write(const char *fmt, ...)
 {
 	if (!g_ra_debug) return;
 	va_list args;
 	va_start(args, fmt);
-	printf("\033[1;35m");
-	vprintf(fmt, args);
-	printf("\033[0m");
+	ra_log_emit(fmt, args);
 	va_end(args);
-	if (g_logfile) {
-		va_start(args, fmt);
-		vfprintf(g_logfile, fmt, args);
-		va_end(args);
-		fflush(g_logfile);
-	}
 }
 
 static void ra_log_impl(const char *fmt, ...)
 {
 	if (!g_ra_debug) return;
 	va_list args;
-
-	// stdout with color
 	va_start(args, fmt);
-	printf("\033[1;35m");
-	vprintf(fmt, args);
-	printf("\033[0m");
+	ra_log_emit(fmt, args);
 	va_end(args);
+}
 
-	// log file without color
-	if (g_logfile) {
-		va_start(args, fmt);
-		vfprintf(g_logfile, fmt, args);
-		va_end(args);
-		fflush(g_logfile);
+// Block until the queue is empty. For shutdown and the crash path, where the
+// log must be on disk before we stop running.
+static void ra_log_drain(void)
+{
+	if (!s_logq_running) return;
+	for (int i = 0; i < 2000; i++) {  // bounded: ~2s worst case, never hangs
+		pthread_mutex_lock(&s_logq_mutex);
+		int empty = (s_logq_head == s_logq_tail);
+		pthread_mutex_unlock(&s_logq_mutex);
+		if (empty) return;
+		usleep(1000);
 	}
 }
 
@@ -100,8 +222,37 @@ static void ra_log_open(void)
 	}
 }
 
+// Start/stop the writer to match async_log. Separate from ra_log_open because
+// the config (and with it the toggle) is parsed later during init; until this
+// runs, ra_log_emit falls back to synchronous writes.
+static void ra_log_apply_config(void)
+{
+	if (g_async_log && !s_logq_running) {
+		s_logq_quit = 0;
+		if (pthread_create(&s_logq_thread, NULL, ra_log_thread, NULL) == 0)
+			s_logq_running = 1;
+	} else if (!g_async_log && s_logq_running) {
+		ra_log_drain();
+		pthread_mutex_lock(&s_logq_mutex);
+		s_logq_quit = 1;
+		pthread_cond_signal(&s_logq_cond);
+		pthread_mutex_unlock(&s_logq_mutex);
+		pthread_join(s_logq_thread, NULL);
+		s_logq_running = 0;
+	}
+}
+
 static void ra_log_close(void)
 {
+	if (s_logq_running) {
+		ra_log_drain();
+		pthread_mutex_lock(&s_logq_mutex);
+		s_logq_quit = 1;
+		pthread_cond_signal(&s_logq_cond);
+		pthread_mutex_unlock(&s_logq_mutex);
+		pthread_join(s_logq_thread, NULL);
+		s_logq_running = 0;   // later logs go synchronous again
+	}
 	if (g_logfile) {
 		time_t now = time(NULL);
 		fprintf(g_logfile, "Closed: %s\n", ctime(&now));
@@ -122,6 +273,17 @@ static void ra_crash_handler(int sig)
 
 	// Write directly to log file (async-signal-safe is best-effort here)
 	if (g_logfile) {
+		// Flush whatever the async writer still holds: the lines right before
+		// a crash are the ones worth having. Drained WITHOUT the mutex on
+		// purpose — the crash may have happened while a producer held it, and
+		// a deadlock here would cost us the backtrace too. The process is
+		// dying, so a torn read is an acceptable trade for not hanging.
+		if (s_logq_running) {
+			unsigned tail = s_logq_tail, head = s_logq_head;
+			if (head - tail > RA_LOGQ_SLOTS) tail = head - RA_LOGQ_SLOTS;
+			for (unsigned i = tail; i != head; i++)
+				fputs(s_logq[i % RA_LOGQ_SLOTS], g_logfile);
+		}
 		fprintf(g_logfile, "\n!!! CRASH: signal %s (%d) !!!\n", name, sig);
 		void *bt[32];
 		int n = backtrace(bt, 32);
@@ -208,6 +370,7 @@ static int g_smart_cleanup             = 1;  // 1 = dynamic-only smart-cache pru
 static int g_justifier_test            = 0;  // 1 = MegaDrive only: cap rtquery busy-wait (~1ms + fail-fast) to A/B test lightgun input latency
 static int g_desc_ticker               = 0;  // 1 = scroll the selected achievement's description on a ticker row in the list view (retroachievements.cfg: list_desc_ticker)
 static int g_list_hotkey               = 0;  // 1 = in-game gamepad shortcut (Menu + Y) opens the achievement list (retroachievements.cfg: list_hotkey)
+static int g_popup_pos                 = INFO_ALIGN_LEFT; // popup corner: left (default) / center / right (retroachievements.cfg: popup_position)
 
 // Debug watch list (retroachievements.cfg: watch=19807d,19795a — RA addresses
 // in hex). Handlers log every value change of these addresses per frame.
@@ -400,7 +563,7 @@ static void ra_osd_poll(void)
 	if (!s_urgent_showing && s_urgent_head != s_urgent_tail) {
 		ra_notif *n = &s_urgent_queue[s_urgent_tail % NOTIF_QUEUE_CAP];
 		s_urgent_tail++;
-		Info(n->text, n->duration_ms + 500, 0, 0, 1);
+		InfoAligned(n->text, n->duration_ms + 500, g_popup_pos, 1);
 		if (n->play_sound) ra_play_achievement_sound();
 		s_urgent_timer    = GetTimer(n->duration_ms);
 		s_urgent_showing  = 1;
@@ -415,7 +578,7 @@ static void ra_osd_poll(void)
 	if (s_instant_pending) {
 		s_instant_pending = 0;
 		if (!s_urgent_showing) {
-			Info(s_instant_text, s_instant_duration_ms + 500, 0, 0, 1);
+			InfoAligned(s_instant_text, s_instant_duration_ms + 500, g_popup_pos, 1);
 			s_instant_timer   = GetTimer(s_instant_duration_ms);
 			s_instant_showing = 1;
 			RA_LOG("OSD: Showing instant notification (%dms)", s_instant_duration_ms);
@@ -517,6 +680,29 @@ static int ra_calculate_rom_md5(const char *path, char *md5_hex_out)
 //   password=YourRAPassword
 //   # Lines starting with # are comments
 
+// Popup corner (popup_position). Accepts the names left / center / right —
+// also "centre" and the numbers 0 / 1 / 2 — case-insensitively. Any other
+// value falls back to the default (left) and is reported in the log.
+static int ra_parse_popup_pos(const char *val)
+{
+	char v[16];
+	snprintf(v, sizeof(v), "%s", val);
+	size_t n = strlen(v);
+	while (n && (v[n-1] == ' ' || v[n-1] == '\t')) v[--n] = '\0';
+
+	if (!strcasecmp(v, "left")   || !strcmp(v, "0")) return INFO_ALIGN_LEFT;
+	if (!strcasecmp(v, "center") || !strcasecmp(v, "centre") || !strcmp(v, "1")) return INFO_ALIGN_CENTER;
+	if (!strcasecmp(v, "right")  || !strcmp(v, "2")) return INFO_ALIGN_RIGHT;
+
+	RA_LOG("Config: popup_position=\"%s\" not supported, falling back to \"left\"", v);
+	return INFO_ALIGN_LEFT;
+}
+
+static const char *ra_popup_pos_name(int pos)
+{
+	return (pos == INFO_ALIGN_CENTER) ? "center" : (pos == INFO_ALIGN_RIGHT) ? "right" : "left";
+}
+
 static int ra_load_credentials(void)
 {
 	g_ra_user[0] = '\0';
@@ -595,6 +781,8 @@ static int ra_load_credentials(void)
 			g_smart_cache = atoi(val);
 		} else if (!strcasecmp(key, "debug")) {
 			g_ra_debug = atoi(val);
+		} else if (!strcasecmp(key, "async_log")) {
+			g_async_log = atoi(val);
 		} else if (!strcasecmp(key, "n64_snapshot")) {
 			g_n64_snapshot = atoi(val);
 		} else if (!strcasecmp(key, "gba_reset_ram")) {
@@ -605,6 +793,8 @@ static int ra_load_credentials(void)
 			g_desc_ticker = atoi(val);
 		} else if (!strcasecmp(key, "list_hotkey")) {
 			g_list_hotkey = atoi(val);
+		} else if (!strcasecmp(key, "popup_position")) {
+			g_popup_pos = ra_parse_popup_pos(val);
 		} else if (!strcasecmp(key, "smart_cleanup")) {
 			g_smart_cleanup = atoi(val);
 		} else if (!strcasecmp(key, "justifier_test")) {
@@ -636,11 +826,11 @@ static int ra_load_credentials(void)
 	}
 
 	RA_LOG("Credentials loaded: user=%s password=***(%zu chars)", g_ra_user, strlen(g_ra_password));
-	RA_LOG("Config: show_challenge_show=%d show_challenge_hide=%d show_progress=%d show_progress_name=%d show_leaderboards_updates=%d show_leaderboards_submission=%d leaderboards_enabled(deprecated)=%d hardcore=%d force_hardcore=%d stall_recovery=%d rtquery=%d recollect=%d smart_cache=%d smart_cleanup=%d justifier_test=%d n64_snapshot=%d gba_reset_ram=%d multiline_desc=%d list_desc_ticker=%d list_hotkey=%d debug=%d",
+	RA_LOG("Config: show_challenge_show=%d show_challenge_hide=%d show_progress=%d show_progress_name=%d show_leaderboards_updates=%d show_leaderboards_submission=%d leaderboards_enabled(deprecated)=%d hardcore=%d force_hardcore=%d stall_recovery=%d rtquery=%d recollect=%d smart_cache=%d smart_cleanup=%d justifier_test=%d n64_snapshot=%d gba_reset_ram=%d multiline_desc=%d list_desc_ticker=%d list_hotkey=%d popup_position=%s debug=%d async_log=%d",
                 g_show_challenge_show_popup, g_show_challenge_hide_popup,
                 g_show_progress_popups, g_show_progress_name,
 		g_show_leaderboards_updates, g_show_leaderboards_submission, g_leaderboards_enabled,
-                g_hardcore, g_force_hardcore, g_stall_recovery, g_rtquery_enabled, g_recollect_interval, g_smart_cache, g_smart_cleanup, g_justifier_test, g_n64_snapshot, g_gba_reset_ram, g_multiline_desc, g_desc_ticker, g_list_hotkey, g_ra_debug);
+                g_hardcore, g_force_hardcore, g_stall_recovery, g_rtquery_enabled, g_recollect_interval, g_smart_cache, g_smart_cleanup, g_justifier_test, g_n64_snapshot, g_gba_reset_ram, g_multiline_desc, g_desc_ticker, g_list_hotkey, ra_popup_pos_name(g_popup_pos), g_ra_debug, g_async_log);
 	return 1;
 }
 
@@ -1439,6 +1629,10 @@ void achievements_init(void)
 	// Load credentials
 	int has_creds = ra_load_credentials();
 
+	// Config is parsed now, so honour async_log (until here logging was
+	// synchronous — and with debug defaulting to 0, silent).
+	ra_log_apply_config();
+
 #ifdef HAS_RCHEEVOS
 	// Create rc_client
 	g_client = rc_client_create(ra_read_memory, ra_server_call);
@@ -1496,6 +1690,18 @@ static void ra_update_user_agent(void)
 void achievements_load_game(const char *rom_path, uint32_t crc32)
 {
         if (!g_active_handler) return;
+
+        // Virtual Boy: the OSD offers auxiliary loads without the config-store
+        // flag (VBT brightness tables, TAS movies) that also land here. Only a
+        // .vb file is a game — ignore everything else so an aux load cannot
+        // rehash and drop the active session.
+        if (g_active_handler->console_id == 28 && rom_path && rom_path[0]) {
+                size_t len = strlen(rom_path);
+                if (len < 3 || strcasecmp(rom_path + len - 3, ".vb") != 0) {
+                        RA_LOG("VirtualBoy: non-ROM load '%s' ignored (session kept)", rom_path);
+                        return;
+                }
+        }
 
         ra_update_user_agent();
 
@@ -2071,7 +2277,8 @@ int achievements_smart_cache_enabled(void)
 	    cid == RC_CONSOLE_SEGA_CD || cid == RC_CONSOLE_SEGA_32X ||
 	    cid == RC_CONSOLE_MASTER_SYSTEM || cid == RC_CONSOLE_GAME_GEAR ||
 	    cid == RC_CONSOLE_PC_ENGINE || cid == RC_CONSOLE_PC_ENGINE_CD ||
-	    cid == RC_CONSOLE_ARCADE || cid == RC_CONSOLE_NEO_GEO_CD) {
+	    cid == RC_CONSOLE_ARCADE || cid == RC_CONSOLE_NEO_GEO_CD ||
+	    cid == RC_CONSOLE_VIRTUAL_BOY) {
 		return 1;
 	}
 #endif
@@ -2103,13 +2310,13 @@ int achievements_justifier_test(void)
 void achievements_info(void)
 {
 	if (!ra_core_supported()) {
-                Info("RetroAchievements\n\nCore not supported", 2000, 0, 0, 1);
+                InfoAligned("RetroAchievements\n\nCore not supported", 2000, g_popup_pos, 1);
                 return;
         }
 
 #ifdef HAS_RCHEEVOS
         if (!ra_has_internet_connectivity()) {
-                Info("RetroAchievements\n\nSem internet\nConecte a rede para o RA funcionar", 2500, 0, 0, 1);
+                InfoAligned("RetroAchievements\n\nSem internet\nConecte a rede para o RA funcionar", 2500, g_popup_pos, 1);
                 return;
         }
 #endif
@@ -2180,7 +2387,7 @@ void achievements_info(void)
 
 	#undef NOTIF_APPEND
 
-	Info(buf, 4000, 0, 0, 1);
+	InfoAligned(buf, 4000, g_popup_pos, 1);
 }
 
 // ---------------------------------------------------------------------------

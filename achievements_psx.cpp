@@ -416,7 +416,9 @@ static int psx_poll(void *map, void *client, int game_loaded)
 				{
 					struct timespec t0, t1;
 					clock_gettime(CLOCK_MONOTONIC, &t0);
-					rc_client_do_frame(rc_client);
+					// Skip frames whose VALCACHE ordering is unconfirmed (see helper).
+					if (seladdr_frame_evaluable(map, "PSX"))
+						rc_client_do_frame(rc_client);
 					clock_gettime(CLOCK_MONOTONIC, &t1);
 					uint64_t dt = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000ULL
 					            + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
