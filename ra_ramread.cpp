@@ -345,6 +345,53 @@ static void s_publish_snapshot(void)
 	s_published_count = s_snes_addr_count;
 }
 
+// Tear-free sample of the FPGA response header.
+//
+// response_id and response_frame share one 64-bit word that the FPGA writes in
+// a single DDRAM transaction, but the ARM read them as two independent 32-bit
+// loads. When the FPGA's write landed between those loads the ARM paired the
+// OLD response_id (so s_sync_active declined to promote) with the NEW
+// response_frame (so the console handler processed the frame): rc_client then
+// indexed a VALCACHE the FPGA had already rewritten in the new revision's
+// ordering using the previous revision's address array. Every cached address
+// returned a neighbour's byte for that whole frame — delta real, mem garbage,
+// which is exactly what fires "value jumped" achievements. Only possible while
+// the list is growing (a revision change is required), which is why it showed
+// up as bursts of spurious unlocks during smart-cache growth.
+//
+// Sample the header once behind a seqlock on response_frame (the FPGA bumps it
+// on every write) and serve sync/caught_up/response_frame from that one sample.
+static uint32_t s_resp_id_seen    = 0;
+static uint32_t s_resp_frame_seen = 0;
+static int      s_resp_valid      = 0;
+
+static void s_refresh_resp(const void *map)
+{
+	if (!map) return;
+	const volatile ra_val_resp_hdr_t *resp = (const volatile ra_val_resp_hdr_t *)
+		((const uint8_t *)map + RA_SNES_VALCACHE_OFFSET);
+
+	uint32_t f0 = resp->response_frame;
+	// Steady state: frame unchanged means the FPGA has not written the header
+	// since the last sample, so response_id cannot have changed either. One
+	// uncached load — cheaper than the two loads this replaces.
+	if (s_resp_valid && f0 == s_resp_frame_seen) return;
+
+	for (int retry = 0; retry < 8; retry++) {
+		uint32_t id = resp->response_id;
+		uint32_t f1 = resp->response_frame;
+		if (f0 == f1) {
+			s_resp_id_seen    = id;
+			s_resp_frame_seen = f0;
+			s_resp_valid      = 1;
+			return;
+		}
+		f0 = f1;
+	}
+	// Header churning faster than we can read it (never observed in practice):
+	// keep the previous sample. Costs a skipped frame, never a misaligned one.
+}
+
 // Promote published → active when the FPGA has confirmed the current revision.
 // Revisions are serialized (see flush/prune), so response_id is either the
 // active id (transition in flight, keep old mapping) or the current request_id
@@ -353,9 +400,9 @@ static void s_publish_snapshot(void)
 static void s_sync_active(const void *map)
 {
 	if (!map) return;
-	const ra_val_resp_hdr_t *resp =
-		(const ra_val_resp_hdr_t *)((const uint8_t *)map + RA_SNES_VALCACHE_OFFSET);
-	uint32_t rid = resp->response_id;
+	s_refresh_resp(map);
+	if (!s_resp_valid) return;
+	uint32_t rid = s_resp_id_seen;
 	if (rid == s_active_id || rid != s_snes_request_id) return;
 	memcpy(s_active_addrs, s_published_addrs, s_published_count * sizeof(uint32_t));
 	s_active_count = s_published_count;
@@ -363,17 +410,32 @@ static void s_sync_active(const void *map)
 }
 
 // 1 when the FPGA has confirmed the latest published list revision.
+// Uses the same sample as s_sync_active: a caught_up that ran ahead of the
+// promotion could publish a further revision the active snapshot never sees.
 static int s_fpga_caught_up(const void *map)
 {
 	if (!map) return 0;
-	const ra_val_resp_hdr_t *resp =
-		(const ra_val_resp_hdr_t *)((const uint8_t *)map + RA_SNES_VALCACHE_OFFSET);
-	return resp->response_id == s_snes_request_id;
+	s_refresh_resp(map);
+	return s_resp_valid && s_resp_id_seen == s_snes_request_id;
 }
 
 // Smart Cache dynamic-add state (see "Smart Cache" section below)
 static int s_dynamic_pending = 0;   // 1 if new addresses added since last flush
 static int s_dynamic_added   = 0;   // count of addresses added this cycle
+static int s_flush_defer_streak = 0; // consecutive freshness-gate deferrals
+
+// Publish-phase tracking. response_frame() is the once-per-poll call every
+// handler makes, so two consecutive calls bracket WHEN the FPGA wrote the
+// response header: it landed between the previous call (which still returned
+// the old frame) and the first call returning the new one. That gives an
+// upper bound on how stale our knowledge of the frame phase is, which the
+// freshness gate (s_publish_window_open) uses to prove a publish cannot
+// collide with the next scan (closes the check-then-act window left by the
+// busy-flag test alone).
+static struct timespec s_rf_prev_call  = {0, 0};
+static struct timespec s_frame_seen_at = {0, 0};
+static uint32_t s_frame_staleness_us = 0xFFFFFFFFu;  // bound on detection lag
+static uint32_t s_rf_last_returned = 0;
 
 #define COLLECT_BUF_MAX (RA_SNES_MAX_ADDRS * 4)
 static uint32_t s_collect_buf[COLLECT_BUF_MAX];
@@ -397,6 +459,12 @@ void ra_snes_addrlist_init(void)
 	s_active_count = 0;
 	s_active_id = 0;
 	s_published_count = 0;
+	s_resp_id_seen = 0;
+	s_resp_frame_seen = 0;
+	s_resp_valid = 0;
+	s_flush_defer_streak = 0;
+	s_rf_last_returned = 0;
+	s_frame_staleness_us = 0xFFFFFFFFu;
 }
 
 void ra_snes_addrlist_begin_collect(void)
@@ -536,15 +604,48 @@ uint32_t ra_snes_addrlist_request_id(void)
 	return s_snes_request_id;
 }
 
+static uint32_t s_ts_diff_us(const struct timespec *a, const struct timespec *b)
+{
+	int64_t us = (int64_t)(a->tv_sec - b->tv_sec) * 1000000
+	           + (a->tv_nsec - b->tv_nsec) / 1000;
+	if (us < 0) return 0;
+	if (us > 0xFFFFFFF0LL) return 0xFFFFFFF0u;
+	return (uint32_t)us;
+}
+
 uint32_t ra_snes_addrlist_response_frame(const void *map)
 {
 	if (!map) return 0;
 	// Called once per poll by every Selective Address console — piggyback the
 	// pending→active promotion check here so no per-console change is needed.
+	// The frame returned must come from the same header sample the promotion
+	// decision used (see s_refresh_resp), never from a fresh load.
 	s_sync_active(map);
-	const uint8_t *base = (const uint8_t *)map;
-	const ra_val_resp_hdr_t *resp = (const ra_val_resp_hdr_t *)(base + RA_SNES_VALCACHE_OFFSET);
-	return resp->response_frame;
+	uint32_t frame = s_resp_valid ? s_resp_frame_seen : 0;
+
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	if (frame != s_rf_last_returned) {
+		s_frame_seen_at = now;
+		s_frame_staleness_us = (s_rf_prev_call.tv_sec | s_rf_prev_call.tv_nsec)
+			? s_ts_diff_us(&now, &s_rf_prev_call) : 0xFFFFFFFFu;
+		s_rf_last_returned = frame;
+	}
+	s_rf_prev_call = now;
+	return frame;
+}
+
+// 1 when a publish provably fits before the next scan: the header write
+// happened at most (elapsed + staleness bound) ago, the next scan starts a
+// full frame period (>= 16.6ms NTSC / 20ms PAL) after it, and the memcpy
+// takes well under 1ms — an 8ms budget leaves >= 7ms of hard margin.
+static int s_publish_window_open(void)
+{
+	if (s_frame_staleness_us == 0xFFFFFFFFu) return 0;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	uint32_t since = s_ts_diff_us(&now, &s_frame_seen_at);
+	return (since + s_frame_staleness_us) < 8000;
 }
 
 void ra_snes_addrlist_diag_dump(const void *map)
@@ -681,6 +782,26 @@ int ra_snes_addrlist_flush_dynamic(void *map)
 	// reads never misalign. Deferred flushes keep s_dynamic_pending set and
 	// retry next frame; the pending addresses are served by rtquery meanwhile.
 	if (!s_fpga_caught_up(map)) return 0;
+	// Never publish while the FPGA is mid-scan (busy set at vblank, cleared
+	// after the response header): S_READ_PAIR re-reads the address array
+	// incrementally DURING the scan, so a memcpy landing mid-scan makes the
+	// FPGA serve a mix of two orderings under the OLD response_id — which the
+	// ARM cannot detect. Deferring one frame costs nothing: the pending
+	// addresses keep being served by rtquery until published (same as the
+	// add→flush gap today).
+	if (ra_ramread_busy(map)) return 0;
+	// Freshness gate: busy alone is check-then-act — a vblank can still land
+	// during the memcpy below. Publish only when the phase argument holds
+	// (see s_publish_window_open); the residual then rounds to zero instead
+	// of ~0.2%/flush. If the ARM is persistently late the gate would starve
+	// list growth, so after 30 consecutive deferrals (~0.5s) fall back to
+	// busy-check-only — the is_ready net downstream still catches that case
+	// as one skipped eval tick.
+	if (!s_publish_window_open()) {
+		if (++s_flush_defer_streak < 30) return 0;
+		RA_DBG("SmartCache flush: freshness fallback after %d deferrals", s_flush_defer_streak);
+	}
+	s_flush_defer_streak = 0;
 	s_dynamic_pending = 0;
 	int flushed = s_dynamic_added;
 	s_dynamic_added = 0;
@@ -733,6 +854,10 @@ int ra_snes_addrlist_prune_dynamic(void *map)
 	// confirmed the current list, so the active snapshot stays the only
 	// other ordering in play. Callers retry on a later cleanup tick.
 	if (map && !s_fpga_caught_up(map)) return 0;
+	// Same mid-scan publish guards as flush_dynamic (see comments there).
+	// No fallback here: a deferred prune just waits for a later cleanup tick.
+	if (map && ra_ramread_busy(map)) return 0;
+	if (map && !s_publish_window_open()) return 0;
 
 	int w = 0;
 	for (int i = 0; i < s_snes_addr_count; i++) {

@@ -183,7 +183,9 @@ g_tgfx16_state.last_resp_frame = resp_frame;
 g_tgfx16_state.game_frames++;
 ra_frame_processed(resp_frame);
 
-rc_client_do_frame(rc_client);
+// Skip frames whose VALCACHE ordering is unconfirmed (see helper).
+if (seladdr_frame_evaluable(map, "TGFX16"))
+	rc_client_do_frame(rc_client);
 
 if (achievements_smart_cleanup_enabled()
 && (g_tgfx16_state.game_frames % 3600 == 0)

@@ -124,7 +124,9 @@ static int megacd_poll(void *map, void *client, int game_loaded)
 				g_mcd_state.last_resp_frame = resp_frame;
 				g_mcd_state.game_frames++;
 				ra_frame_processed(resp_frame);
-				rc_client_do_frame(rc_client);
+				// Skip frames whose VALCACHE ordering is unconfirmed (see helper).
+				if (seladdr_frame_evaluable(map, "MegaCD"))
+					rc_client_do_frame(rc_client);
 				if (achievements_smart_cleanup_enabled()
 					&& (g_mcd_state.game_frames % 3600 == 0)
 					&& ra_snes_addrlist_dyn_count() > 128) {
