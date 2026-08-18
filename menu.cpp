@@ -8198,8 +8198,7 @@ void InfoAligned(const char *message, int timeout, int align, int frame)
 		OsdUpdate();
 	}
 }
-
-void InfoAt(const char *message, int timeout, int y_pos, int frame)
+void InfoAt(const char *message, int timeout, int y_pos, int frame, bool center)
 {
 	if (menustate <= MENU_INFO)
 	{
