@@ -47,6 +47,7 @@
 static FILE *g_logfile = NULL;
 static int g_ra_debug = 0; // forward decl — defined/loaded in ra_load_credentials
 static int g_async_log = 1; // retroachievements.cfg: async_log (1 = writer thread)
+static int g_trigger_dump = 1; // retroachievements.cfg: trigger_dump (needs debug=1)
 
 #define RA_LOG(fmt, ...) ra_log_impl("RA: " fmt "\n", ##__VA_ARGS__)
 
@@ -783,6 +784,8 @@ static int ra_load_credentials(void)
 			g_ra_debug = atoi(val);
 		} else if (!strcasecmp(key, "async_log")) {
 			g_async_log = atoi(val);
+		} else if (!strcasecmp(key, "trigger_dump")) {
+			g_trigger_dump = atoi(val);
 		} else if (!strcasecmp(key, "n64_snapshot")) {
 			g_n64_snapshot = atoi(val);
 		} else if (!strcasecmp(key, "gba_reset_ram")) {
@@ -1056,6 +1059,8 @@ static void ra_event_handler(const rc_client_event_t *event, rc_client_t *client
 					event->achievement->id, event->achievement->title,
 					event->achievement->description);
 					gba_dump_trigger(event->achievement->id);
+					seladdr_trigdump_report(event->achievement->id,
+						event->achievement->title);
 				char title_buf[96];
 				ra_format_text(event->achievement->title, title_buf, sizeof(title_buf), 28, 28, 2);
 				// In multiline mode, prefix desc with "\-> " so it reads as a
@@ -2300,6 +2305,13 @@ int achievements_watch_list(const uint32_t **addrs)
 int achievements_smart_cleanup_enabled(void)
 {
 	return g_smart_cleanup;
+}
+
+int achievements_trigger_dump(void)
+{
+	// Gated on debug as well: without logging the window could never be
+	// printed, so keeping it would only cost a DDRAM read every frame.
+	return g_ra_debug && g_trigger_dump;
 }
 
 int achievements_justifier_test(void)
