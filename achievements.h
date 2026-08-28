@@ -115,6 +115,10 @@ int achievements_watch_list(const uint32_t **addrs);
 // when they pile up; the static bootstrap set is never pruned, and pruned
 // addresses that are still needed re-add themselves via rtquery misses.
 int achievements_smart_cleanup_enabled(void);
+// 1 when the per-frame value-cache window for trigger dumps should be kept.
+// Implies debug: with logging off the dump could never be printed, so the
+// per-frame snapshot would be pure cost.
+int achievements_trigger_dump(void);
 
 // 1 = MegaDrive-only lightgun A/B test (retroachievements.cfg: justifier_test,
 // default 0): keeps the smart cache but caps the rtquery busy-wait (~1ms,

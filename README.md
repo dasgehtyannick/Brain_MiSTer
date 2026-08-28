@@ -8,14 +8,14 @@ This is a fork of the official [MiSTer Main binary](https://github.com/MiSTer-de
 
 | Core | Console ID | Hardcore | Modified Core Repo |
 |------|-----------|----------|--------------------|
-| NES | 7 | ✅ Officially Supported | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
-| Famicom Disk System (via NES core) | 81 | ✅ Officially Supported | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
-| SNES (incl. SA-1 / SuperFX) | 3 | ✅ Officially Supported | [odelot/SNES_MiSTer](https://github.com/odelot/SNES_MiSTer) |
-| Genesis / Mega Drive | 1 | ✅ Officially Supported | [odelot/MegaDrive_MiSTer](https://github.com/odelot/MegaDrive_MiSTer) |
-| N64 | 2 | ✅ Officially Supported | [odelot/N64_MiSTer](https://github.com/odelot/N64_MiSTer) |
-| PSX | 12 | ✅ Officially Supported | [odelot/PSX_MiSTer](https://github.com/odelot/PSX_MiSTer) |
+| NES | 7 | ✅ Supported | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
+| Famicom Disk System (via NES core) | 81 | ✅ Supported | [odelot/NES_MiSTer](https://github.com/odelot/NES_MiSTer) |
+| SNES (incl. SA-1 / SuperFX) | 3 | ✅ Supported | [odelot/SNES_MiSTer](https://github.com/odelot/SNES_MiSTer) |
+| Genesis / Mega Drive | 1 | ✅ Supported | [odelot/MegaDrive_MiSTer](https://github.com/odelot/MegaDrive_MiSTer) |
+| N64 | 2 | ✅ Supported | [odelot/N64_MiSTer](https://github.com/odelot/N64_MiSTer) |
+| PSX | 12 | ✅ Supported | [odelot/PSX_MiSTer](https://github.com/odelot/PSX_MiSTer) |
+| Gameboy / Gameboy Color | 4 / 6 | ✅ Supported | [odelot/Gameboy_MiSTer](https://github.com/odelot/Gameboy_MiSTer) |
 | Master System / Game Gear | 11 / 15 | 🔧 wired, in validation | [odelot/SMS_MiSTer](https://github.com/odelot/SMS_MiSTer) |
-| Gameboy / Gameboy Color | 4 / 6 | 🔧 wired, in validation | [odelot/Gameboy_MiSTer](https://github.com/odelot/Gameboy_MiSTer) |
 | GBA (Game Boy Advance) | 5 | 🔧 wired, in validation | [odelot/GBA_MiSTer](https://github.com/odelot/GBA_MiSTer) |
 | Mega CD / Sega CD | 9 | 🔧 wired, in validation | [odelot/MegaCD_MiSTer](https://github.com/odelot/MegaCD_MiSTer) |
 | TurboGrafx-16 / PC Engine (incl. CD) | 8 / 76 | 🔧 wired, in validation | [odelot/TurboGrafx16_MiSTer](https://github.com/odelot/TurboGrafx16_MiSTer) |
@@ -138,8 +138,8 @@ Hardcore is only actually engaged on cores that enforce the restrictions **in ha
 
 | Status | Cores | Meaning |
 |--------|-------|---------|
-| ✅ **Officially Supported** | NES, FDS, SNES, Genesis/MD, N64, PSX | FPGA guardrails validated; `hardcore=1` engages real hardcore (cheats disabled, restore-state blocked in hardware) |
-| 🔧 **Wired, in validation** | SMS/GG, GB/GBC, GBA, MegaCD, TG16, 32X | The core RTL has the hardcore guardrails and Main maps the status bits, but the homologation checklist isn't complete - these cores still run casual unless you set `force_hardcore=1` (for testing at your own risk) |
+| ✅ **Officially Supported** | NES, FDS, SNES, Genesis/MD, N64, PSX, GB/GBC | FPGA guardrails validated; `hardcore=1` engages real hardcore (cheats disabled, restore-state blocked in hardware) |
+| 🔧 **Wired, in validation** | SMS/GG, GBA, MegaCD, TG16, 32X | The core RTL has the hardcore guardrails and Main maps the status bits, but the homologation checklist isn't complete - these cores still run casual unless you set `force_hardcore=1` (for testing at your own risk) |
 | - **casual only** | NeoGeo, Atari 2600/7800, Saturn | No hardcore bits wired (2600/7800/Saturn cores have no cheat engine / savestates to block; NeoGeo pending) |
 
 Per-core enforcement details (status bits written by Main):
