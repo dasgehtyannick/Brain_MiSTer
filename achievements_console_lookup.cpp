@@ -1,6 +1,7 @@
 // achievements_console_lookup.cpp — Console handler lookup table
 
 #include "achievements_console.h"
+#include <stdio.h>
 #include <string.h>
 #include <strings.h>
 
@@ -165,9 +166,92 @@ int seladdr_resync_if_backward(console_state_t *state, uint32_t resp_frame,
 // means a publish slipped past them and is worth investigating. Note that
 // ra_snes_addrlist_end_collect (periodic recollect on GB/NeoGeo/PSX) has no
 // such guard yet, so those cores are the likeliest to surface one.
+// ---------------------------------------------------------------------------
+// Trigger dump: rolling window of the value cache
+//
+// A false unlock is a *transition* ("delta below the threshold, current value
+// above it"), so a snapshot taken when the achievement fires cannot explain
+// it — the value that mattered is the one from the frame before. Keep the last
+// few evaluated frames of the value cache and print the whole window when an
+// achievement triggers, so the offending transition is visible.
+//
+// Opt-in (retroachievements.cfg: trigger_dump, and only with debug=1): the
+// per-frame snapshot is a bulk read from uncached DDRAM — cheap for a small
+// list, not free for a core tracking hundreds of addresses.
+// ---------------------------------------------------------------------------
+#define TRIGDUMP_FRAMES 8
+
+static uint8_t  s_td_vals[TRIGDUMP_FRAMES][RA_SNES_MAX_ADDRS];
+static uint32_t s_td_addrs[RA_SNES_MAX_ADDRS];
+static uint32_t s_td_frame[TRIGDUMP_FRAMES];
+static int      s_td_count  = 0;
+static int      s_td_head   = 0;
+static int      s_td_filled = 0;
+
+static void seladdr_trigdump_snapshot(void *map)
+{
+        if (!achievements_trigger_dump() || !map) return;
+
+        int n = ra_snes_addrlist_active_count();
+        if (n <= 0) return;
+        if (n > RA_SNES_MAX_ADDRS) n = RA_SNES_MAX_ADDRS;
+
+        // Any list revision shifts every column, so a table spanning one would
+        // not line up. Restart the window instead of printing a misleading one.
+        const uint32_t *cur = ra_snes_addrlist_active_addrs();
+        if (n != s_td_count || memcmp(s_td_addrs, cur, (size_t)n * sizeof(uint32_t))) {
+                memcpy(s_td_addrs, cur, (size_t)n * sizeof(uint32_t));
+                s_td_count  = n;
+                s_td_filled = 0;
+                s_td_head   = 0;
+        }
+
+        // One bulk read, not n binary searches + n uncached byte reads.
+        memcpy(s_td_vals[s_td_head],
+               (const uint8_t *)map + RA_SNES_VALCACHE_OFFSET + 8, (size_t)n);
+        s_td_frame[s_td_head] = ra_snes_addrlist_response_frame(map);
+
+        s_td_head = (s_td_head + 1) % TRIGDUMP_FRAMES;
+        if (s_td_filled < TRIGDUMP_FRAMES) s_td_filled++;
+}
+
+void seladdr_trigdump_report(uint32_t ach_id, const char *title)
+{
+        if (!achievements_trigger_dump() || s_td_filled == 0) return;
+
+        int first = (s_td_head - s_td_filled + TRIGDUMP_FRAMES) % TRIGDUMP_FRAMES;
+
+        char hdr[160];
+        int p = 0;
+        for (int f = 0; f < s_td_filled && p < (int)sizeof(hdr) - 12; f++)
+                p += snprintf(hdr + p, sizeof(hdr) - p, " %u", s_td_frame[(first + f) % TRIGDUMP_FRAMES]);
+
+        ra_log_write("TRIGDUMP [%u] %s: %d addrs, last %d evaluated frames (oldest->newest), resp_frame:%s\n",
+                ach_id, title ? title : "", s_td_count, s_td_filled, hdr);
+
+        for (int i = 0; i < s_td_count; i++) {
+                char line[128];
+                int q = 0, changed = 0;
+                uint8_t prev = 0;
+                for (int f = 0; f < s_td_filled && q < (int)sizeof(line) - 4; f++) {
+                        uint8_t v = s_td_vals[(first + f) % TRIGDUMP_FRAMES][i];
+                        if (f && v != prev) changed = 1;
+                        prev = v;
+                        q += snprintf(line + q, sizeof(line) - q, " %02X", v);
+                }
+                // '*' marks an address that moved inside the window — the
+                // transition that fired the achievement is on one of these.
+                ra_log_write("  TD %c addr=0x%05X :%s\n",
+                        changed ? '*' : ' ', s_td_addrs[i], line);
+        }
+}
+
 int seladdr_frame_evaluable(void *map, const char *console_name)
 {
-        if (ra_snes_addrlist_is_ready(map)) return 1;
+        if (ra_snes_addrlist_is_ready(map)) {
+                seladdr_trigdump_snapshot(map);
+                return 1;
+        }
 
         // Rate-limited: loud for the first few, then a periodic heartbeat, so a
         // persistent problem is visible without flooding the log at 60/s.

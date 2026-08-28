@@ -117,4 +117,9 @@ int seladdr_frame_evaluable(void *map, const char *console_name);
 // GBA: dump valcache when an achievement triggers (call from event handler)
 void gba_dump_trigger(uint32_t ach_id);
 
+// Print the rolling value-cache window captured by the Selective Address
+// handlers (see trigger_dump). Call from the achievement-triggered event so a
+// false unlock can be traced to the exact address and frame that moved.
+void seladdr_trigdump_report(uint32_t ach_id, const char *title);
+
 #endif // ACHIEVEMENTS_CONSOLE_H
