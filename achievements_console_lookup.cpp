@@ -140,11 +140,30 @@ int seladdr_resync_if_backward(console_state_t *state, uint32_t resp_frame,
                                 const char *console_name)
 {
         if (resp_frame < state->last_resp_frame) {
-                ra_log_write("%s SelAddr: resp_frame went backward (%u -> %u) -- FPGA reset without notify, resyncing\n",
+                ra_log_write("%s SelAddr: resp_frame went backward (%u -> %u) -- FPGA reset without notify, re-bootstrapping\n",
                         console_name, state->last_resp_frame, resp_frame);
                 state->last_resp_frame = resp_frame;
                 clock_gettime(CLOCK_MONOTONIC, &state->stall_time);
                 state->stall_frame = resp_frame;
+
+                // The machine restarted behind our back. Realigning the frame
+                // counter alone used to be the whole recovery, which left the
+                // rc_client runtime armed and evaluating whatever RAM the
+                // restarted core produced: an SMS "Eject ROM" (status[9], never
+                // reported to the ARM) unlocked both of Dragon Wang's score
+                // achievements from the garbage a cartridge-less Z80 writes.
+                // Drop the cache instead, exactly as stall recovery does, so
+                // the next poll re-runs the bootstrap -- that path re-primes
+                // rc_client to WAITING before any value is evaluated.
+                //
+                // Every caller has the shape
+                //     seladdr_resync_if_backward(...);
+                //     if (resp_frame > state->last_resp_frame) { ...do_frame... }
+                // so clearing last_resp_frame above already keeps this frame
+                // from being evaluated; no caller needs to change.
+                state->cache_ready     = 0;
+                state->needs_recollect = 0;
+                ra_snes_addrlist_init();
                 return 1;
         }
         return 0;

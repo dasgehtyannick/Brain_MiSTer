@@ -326,6 +326,13 @@ char is_gba()
 	return (is_gba_type == 1);
 }
 
+static int is_sms_type = 0;
+char is_sms()
+{
+	if (!is_sms_type) is_sms_type = strcasecmp(orig_name, "SMS") ? 2 : 1;
+	return (is_sms_type == 1);
+}
+
 static int is_c64_type = 0;
 char is_c64()
 {
@@ -441,6 +448,7 @@ void user_io_read_core_name()
 	is_pce_type = 0;
 	is_archie_type = 0;
 	is_gba_type = 0;
+	is_sms_type = 0;
 	is_c64_type = 0;
 	is_c128_type = 0;
 	is_atari800_type = 0;
