@@ -2645,7 +2645,36 @@ void HandleUI(void)
 									// Notify RA only after the reset pulse: notifying before it
 									// leaves a window where an in-flight FPGA VBlank scan rewrites
 									// the response header after the ARM already cleared the mirror.
+									//
+									// SMS "Eject ROM" is status[9], which the plain !bit test
+									// above cannot see. It feeds raw_reset and drops the cartridge,
+									// leaving the core running with nothing loaded -- and this core
+									// does not pause for the OSD, so triggers that stay armed get
+									// evaluated against the garbage a cartridge-less Z80 writes into
+									// RAM (that is how both of Dragon Wang's score achievements
+									// unlocked on eject). End the session outright.
+									//
+									// SMS "Soft Reset" (status[11] and the joypad button) is NOT a
+									// reset and must not be reported as one: io.vhd drives it onto
+									// port $DD bit 4 as a plain readable input, exactly like real
+									// hardware and Genesis Plus GX. The Z80 keeps running and RAM is
+									// untouched; if the game restarts it is the game's own code
+									// doing it, which is what the reference emulator shows rcheevos.
+									//
+									// A savestate restore is neither of those. Only SMS ([62]) and
+									// SNES ([48]) expose one in the OSD today, on different bits and
+									// with different spelling, so match the conf-string label rather
+									// than tabulating bits per core. (F1 and the joypad shortcut are
+									// decoded inside savestate_ui.sv and never reach the ARM, so
+									// those two paths stay uncovered until the RTL reports them.)
 									if (!bit) achievements_notify_core_reset();
+									else if (is_sms() && !ex && bit == 9) achievements_unload_game();
+									else
+									{
+										char lbl[256];
+										substrcpy(lbl, p, 1);
+										if (strcasestr(lbl, "load state")) achievements_notify_state_loaded();
+									}
 
 									menustate = MENU_GENERIC_MAIN1;
 									if (p[0] == 'R' || p[0] == 'r') menustate = MENU_NONE1;
