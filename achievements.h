@@ -33,6 +33,16 @@ void achievements_unload_game(void);
 // Notify RA runtime that an in-core reset happened (without unloading the game).
 void achievements_notify_core_reset(void);
 
+// Notify RA runtime that a savestate was restored (softcore only — hardcore
+// blocks state loads in RTL). Emulators serialize the rcheevos runtime into the
+// savestate and restore it here, which carries the delta baseline (each
+// memref's 'prior') across the load. MiSTer savestates are produced by the core
+// in the FPGA, so there is no room for that blob and we are permanently in the
+// "no achievement data in this state" case, which rc_client handles by
+// resetting the runtime. NOT the same as a core reset: this must not satisfy
+// the hardcore waiting_for_reset gate. See achievements_notify_state_loaded().
+void achievements_notify_state_loaded(void);
+
 // Notify that save-RAM I/O between the core and the ARM is happening (autosave
 // on OSD-open, manual save/load backup). Cores that share the save port with
 // the RA read path (e.g. SNES BSRAM Port B) return bytes from the SD transfer

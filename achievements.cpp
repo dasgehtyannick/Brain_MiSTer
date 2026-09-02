@@ -2212,6 +2212,34 @@ void achievements_notify_core_reset(void)
 
 }
 
+void achievements_notify_state_loaded(void)
+{
+        if (!g_active_handler) return;
+
+#ifdef HAS_RCHEEVOS
+        if (!g_client || !g_game_loaded) return;
+
+        // Deliberately NOT rc_client_reset(). A savestate load is not a reset:
+        //   - rc_client_reset() clears game->waiting_for_reset, the gate that
+        //     holds processing after hardcore is switched on until a genuine
+        //     reset happens. Letting a state load satisfy it would open exactly
+        //     the hole that gate exists to close.
+        //   - rc_client_reset() also unloads the game when the media hash no
+        //     longer matches, which has nothing to do with restoring a state.
+        //
+        // rc_client_deserialize_progress(NULL) is the path the library provides
+        // for "this savestate carries no achievement data": it runs the subset
+        // before/after hooks (needed for v12 multiset), hides the progress
+        // tracker, and resets the runtime — so every trigger goes back to
+        // WAITING and no delta spans the load boundary.
+        int res = rc_client_deserialize_progress(g_client, NULL);
+        RA_LOG("--- State Loaded --- runtime reset via deserialize_progress(NULL), res=%d", res);
+
+        // The addresses being watched do not change across a state load, only
+        // their values, so the SelAddr list stays valid and is left alone.
+#endif
+}
+
 void achievements_deinit(void)
 {
 	RA_LOG("=== Shutdown ===");
